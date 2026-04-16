@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+nex-cite-check — mandatory citation validator for neos docs.
+
+Hallucinated citations are a well-known LLM failure mode. When AI writes
+papers or documentation, arXiv IDs, author lists, years, and venues get
+fabricated in plausible-looking form. This tool fetches the authoritative
+metadata from arXiv (for arXiv IDs) or Crossref (for DOIs) and compares
+it against what the document claims.
+
+Exit codes:
+  0 — every citation resolves and matches its on-page context
+  1 — one or more citations failed validation (fabricated ID, wrong
+      author, wrong year, or could not be resolved). Gate-blocking.
+  2 — operational error (no network, API down, etc.)
+      IMPORTANT: in strict mode (default) this also fails the gate.
+      Unvalidated is NOT the same as validated.
+
+Usage:
+  nex-cite-check                    # scan all docs/*.md + README.md
+  nex-cite-check docs/why-hle.md    # scan a specific file
+  nex-cite-check --json             # emit machine-readable report
+  nex-cite-check --offline          # non-strict: skip network, only lint structure
+"""
+import argparse
+import json
+import re
+import sys
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+KERNEL = Path(__file__).resolve().parent.parent
+
+ARXIV_ID_RE = re.compile(r"arxiv(?:[:\.\-]|\s*:\s*)?(\d{4}\.\d{4,5})", re.IGNORECASE)
+ARXIV_URL_RE = re.compile(r"arxiv\.org/abs/(\d{4}\.\d{4,5})", re.IGNORECASE)
+DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+
+ARXIV_NS = {"a": "http://www.w3.org/2005/Atom"}
+ARXIV_API = "http://export.arxiv.org/api/query?id_list={}"
+CROSSREF_API = "https://api.crossref.org/works/{}"
+
+UA = "neos-cite-check/0.1 (https://github.com/tejasphatak/neos)"
+
+
+CONTEXT_WINDOW = 5  # ± lines around a citation used for author/title/year matching
+
+
+def _window_context(lines, i, window=CONTEXT_WINDOW):
+    """Return surrounding ±window lines joined, for fuzzy matching. A citation's
+    supporting author/title/year often appears a few lines above or below the
+    bare arXiv ID (e.g. in a section heading or table row)."""
+    lo = max(0, i - 1 - window)
+    hi = min(len(lines), i + window)
+    return " \n ".join(lines[lo:hi])
+
+
+def extract_citations(text, path):
+    """Return list of (kind, id, line_number, windowed_context, path) tuples."""
+    lines = text.splitlines()
+    cites = []
+    for i, line in enumerate(lines, 1):
+        for m in ARXIV_ID_RE.finditer(line):
+            cites.append(("arxiv", m.group(1), i, _window_context(lines, i), path))
+        for m in ARXIV_URL_RE.finditer(line):
+            cites.append(("arxiv", m.group(1), i, _window_context(lines, i), path))
+        for m in DOI_RE.finditer(line):
+            doi = m.group(0).rstrip(".,;)")
+            if "/" in doi and len(doi) < 80:
+                cites.append(("doi", doi, i, _window_context(lines, i), path))
+    # Dedupe on (kind, id, path) keeping first occurrence
+    seen = set()
+    uniq = []
+    for kind, cid, ln, ctx, pth in cites:
+        key = (kind, cid.lower(), str(pth))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((kind, cid, ln, ctx, pth))
+    return uniq
+
+
+def fetch_arxiv(arxiv_id, timeout=10):
+    """Return (title, authors, year) or raise on failure."""
+    req = urllib.request.Request(ARXIV_API.format(arxiv_id), headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    root = ET.fromstring(data)
+    entry = root.find("a:entry", ARXIV_NS)
+    if entry is None:
+        raise ValueError("arxiv API returned no entry (likely invalid ID)")
+    # Some invalid IDs return a dummy entry — check if id tag matches
+    id_el = entry.find("a:id", ARXIV_NS)
+    if id_el is not None and arxiv_id not in (id_el.text or ""):
+        raise ValueError(f"arxiv API returned a different id: {id_el.text}")
+    title = (entry.find("a:title", ARXIV_NS).text or "").strip()
+    authors = [
+        (a.find("a:name", ARXIV_NS).text or "").strip()
+        for a in entry.findall("a:author", ARXIV_NS)
+    ]
+    pub = entry.find("a:published", ARXIV_NS)
+    year = (pub.text or "")[:4] if pub is not None else ""
+    return title, authors, year
+
+
+def fetch_crossref(doi, timeout=10):
+    req = urllib.request.Request(
+        CROSSREF_API.format(urllib.parse.quote(doi, safe="/")),
+        headers={"User-Agent": UA, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read())
+    msg = data.get("message", {})
+    title = " ".join(msg.get("title", []) or [])
+    authors = [f"{a.get('given','')} {a.get('family','')}".strip() for a in msg.get("author", []) or []]
+    year = ""
+    issued = msg.get("issued", {}).get("date-parts", [])
+    if issued and issued[0]:
+        year = str(issued[0][0])
+    return title, authors, year
+
+
+def match_citation(kind, cid, context, title, authors, year):
+    """Fuzzy-match the cited string against authoritative metadata.
+    Returns (ok: bool, problems: [str])."""
+    problems = []
+    ctx_low = context.lower()
+
+    # Year check — if the context contains any 4-digit year in (1950, 2100],
+    # at least one must match the returned year.
+    years_in_ctx = re.findall(r"\b(19[5-9]\d|20\d{2}|21\d{2})\b", context)
+    if years_in_ctx and year and str(year) not in years_in_ctx:
+        problems.append(f"year mismatch: cited says {years_in_ctx}, arXiv says {year}")
+
+    # Author check — at least one surname from the API authors must appear
+    # in the citation context (case-insensitive).
+    if authors:
+        surnames = []
+        for a in authors:
+            parts = a.split()
+            if parts:
+                surnames.append(parts[-1].lower())
+        if surnames and not any(sn in ctx_low for sn in surnames):
+            problems.append(f"author mismatch: none of {surnames[:3]} found in citation text")
+
+    # Title sanity — at least one "significant" word (>4 chars, alphabetic)
+    # from the returned title should appear in the citation context.
+    if title:
+        title_words = [w.lower() for w in re.findall(r"[A-Za-z]+", title) if len(w) > 4]
+        # Skip extremely generic words
+        stopwords = {"paper", "study", "model", "models", "results", "method", "methods"}
+        title_words = [w for w in title_words if w not in stopwords]
+        if title_words and not any(w in ctx_low for w in title_words[:8]):
+            problems.append(f"title mismatch: no significant word from '{title[:50]}...' found in citation text")
+
+    return (len(problems) == 0, problems)
+
+
+def validate(cite, strict_network=True, verbose=False):
+    kind, cid, line, context, path = cite
+    result = {
+        "file": str(path),
+        "line": line,
+        "kind": kind,
+        "id": cid,
+        "context": context,
+        "status": "unknown",
+        "problems": [],
+        "resolved": None,
+    }
+    try:
+        if kind == "arxiv":
+            title, authors, year = fetch_arxiv(cid)
+        elif kind == "doi":
+            title, authors, year = fetch_crossref(cid)
+        else:
+            result["status"] = "skipped"
+            return result
+        result["resolved"] = {"title": title, "authors": authors[:5], "year": year}
+        ok, problems = match_citation(kind, cid, context, title, authors, year)
+        result["status"] = "valid" if ok else "mismatch"
+        result["problems"] = problems
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError, TimeoutError) as e:
+        result["status"] = "unresolved"
+        result["problems"].append(f"API error: {type(e).__name__}: {e}")
+    except Exception as e:
+        result["status"] = "error"
+        result["problems"].append(f"{type(e).__name__}: {e}")
+    return result
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Validate citations in neos docs against authoritative sources.")
+    ap.add_argument("paths", nargs="*", default=None, help="Files or globs to scan (default: docs/*.md + README.md)")
+    ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
+    ap.add_argument("--offline", action="store_true", help="Skip network; structural lint only (NON-STRICT)")
+    ap.add_argument("--max", type=int, default=50, help="Safety cap on network calls per run")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if not args.paths:
+        paths = sorted((KERNEL / "docs").glob("*.md")) + [KERNEL / "README.md"]
+    else:
+        paths = [Path(p) for p in args.paths]
+
+    cites = []
+    for p in paths:
+        if not p.exists():
+            continue
+        text = p.read_text()
+        cites.extend(extract_citations(text, p))
+
+    if args.offline:
+        print(f"[offline] extracted {len(cites)} citation(s); no network validation performed.")
+        for c in cites:
+            print(f"  {c[4]}:{c[2]}  {c[0]}:{c[1]}")
+        # Offline mode is NON-STRICT — exits 0 if extraction succeeds.
+        # Strict mode (default) requires network-verified resolution.
+        return 0
+
+    if len(cites) > args.max:
+        print(f"error: {len(cites)} citations exceeds --max {args.max}; raise --max or split the run", file=sys.stderr)
+        return 2
+
+    results = []
+    for i, c in enumerate(cites, 1):
+        r = validate(c, strict_network=True, verbose=args.verbose)
+        results.append(r)
+        if not args.json:
+            icon = {"valid": "✓", "mismatch": "✗", "unresolved": "✗", "error": "!", "skipped": "-"}[r["status"]]
+            print(f"{icon} {r['file']}:{r['line']}  {r['kind']}:{r['id']}  [{r['status']}]")
+            if r["problems"]:
+                for pb in r["problems"]:
+                    print(f"    • {pb}")
+            if args.verbose and r.get("resolved"):
+                res = r["resolved"]
+                print(f"    resolved: '{res['title'][:70]}' ({res['year']}) by {res['authors'][:2]}")
+        # Gentle rate limit to arxiv.org (3s between calls per their guidance)
+        if i < len(cites):
+            time.sleep(3)
+
+    if args.json:
+        print(json.dumps({"citations": results, "summary": {
+            "total": len(results),
+            "valid": sum(1 for r in results if r["status"] == "valid"),
+            "mismatch": sum(1 for r in results if r["status"] == "mismatch"),
+            "unresolved": sum(1 for r in results if r["status"] == "unresolved"),
+        }}, indent=2))
+
+    bad = [r for r in results if r["status"] in ("mismatch", "unresolved", "error")]
+    if bad:
+        if not args.json:
+            print(f"\nFAIL: {len(bad)} of {len(results)} citation(s) failed validation.")
+            print("Every citation in neos must resolve and match its context. Hallucinated citations are gate-blocking.")
+        return 1
+
+    if not args.json:
+        print(f"\nPASS: all {len(results)} citation(s) resolved and matched context.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -45,17 +45,15 @@ Dependency-free. Covers: config schema, HLE text-only filter against synthetic f
 
 ## Documentation
 
+- [`docs/getting-started.md`](docs/getting-started.md) — **deploy end to end.** Copy-pasteable: install → configure → first agent → second agent → systemd → cross-VM state move → debug table.
 - [`docs/architecture.md`](docs/architecture.md) — threads, meeting room, rate budget.
-- [`docs/attention-dispatch.md`](docs/attention-dispatch.md) — gate state machine + semantic scoring.
 - [`docs/reasoning-benchmarks.md`](docs/reasoning-benchmarks.md) — pre-boot gates + systemd wiring.
 - [`docs/why-hle.md`](docs/why-hle.md) — HLE rationale, threshold calibration, v0.2 integration plan.
-- [`docs/hitl.md`](docs/hitl.md) — principal consultation, tiebreaker protocol.
-- [`docs/faculty-system.md`](docs/faculty-system.md) — adding / modifying faculties, SFCA credit.
-- [`docs/prior-art.md`](docs/prior-art.md) — what's novel, must-cite list.
-- [`docs/backend-abstraction.md`](docs/backend-abstraction.md) — removing Claude Code dependency (roadmap).
 - [`docs/authorship.md`](docs/authorship.md) — who wrote this, the agent drifts, how the session looked.
 - [`docs/disclaimer.md`](docs/disclaimer.md) — the legal bit (read before deploying).
 - [`docs/style.md`](docs/style.md) — documentation + code conventions.
+
+_Roadmap docs (v0.2): attention-dispatch, hitl, faculty-system, prior-art, backend-abstraction, why-embeddings._
 
 ## Status
 
