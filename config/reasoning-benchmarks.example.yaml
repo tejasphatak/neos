@@ -8,12 +8,20 @@
 # Pluggable — add / remove benchmarks as they evolve. Not hardcoded.
 
 reasoning_gates:
-  # Humanity's Last Exam — frontier reasoning benchmark
-  # https://huggingface.co/datasets/cais/hle
-  # Released: Scale AI + CAIS, Jan 2025 (arXiv:2501.14249)
-  # Full run: ~2700 questions across 100+ domains.
-  # HLE is multimodal (image+text questions exist). We filter to text-only
-  # for this gate — the kernel backend contract is text-in/text-out and
+  # Humanity's Last Exam (HLE) — frontier reasoning benchmark
+  #   Official site:  https://agi.safe.ai
+  #   Paper:          https://arxiv.org/abs/2501.14249 (Phan et al., Jan 2025)
+  #   Dataset:        https://huggingface.co/datasets/cais/hle (gated; request access)
+  #   Eval scripts:   https://github.com/centerforaisafety/hle  (v0.2 wraps these)
+  #   Published by Scale AI + Center for AI Safety (CAIS).
+  # Why HLE: see docs/why-hle.md. Short version — it's the only current
+  # benchmark that is non-saturated on frontier models, expert-calibrated,
+  # broadly-covered (100+ domains), publicly auditable, and cheap to
+  # subsample. Using it inherits the field's credibility instead of
+  # inventing our own rubric.
+  # Full run: ~2500 questions across 100+ domains (text-only subset ~76%).
+  # HLE is multimodal (~24% image-bearing questions). We filter to
+  # text-only for this gate — kernel contract is text-in/text-out, and
   # multimodal capacity is a separate axis tested elsewhere.
   - name: hle
     source: huggingface:cais/hle

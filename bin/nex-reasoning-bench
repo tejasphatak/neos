@@ -40,6 +40,15 @@ BASELINE_STAMP = STATE_DIR / "baseline-pass.json"
 AGENT_STAMPS = STATE_DIR / "agent-stamps"
 LOG_DIR = STATE_DIR / "reasoning-bench-logs"
 
+# Shared filter library (also exercised by tests/test_hle_filter.py).
+sys.path.insert(0, str(KERNEL))
+try:
+    from lib.hle import filter_text_only, parse_score_line, pass_rate  # noqa: F401
+except ImportError:
+    # lib/ is optional for the v0.1 scaffold path; the real loader in v0.2
+    # will require it.
+    filter_text_only = None
+
 
 def load_config():
     path = CONFIG if CONFIG.exists() else CONFIG_EXAMPLE
@@ -110,12 +119,15 @@ def run_gate(target, gate_cfg, dry_run=False):
     print(f"  running {name} ({subsample} questions, threshold {threshold}%)"
           f"{' [text-only]' if flt == 'text-only' else ''}...")
 
-    # v0.1 scaffold — real HF loading + scoring lands in v0.2.
-    # For HLE specifically, v0.2 must filter rows with non-empty `image` field
-    # when filter: text-only.
+    # v0.1 scaffold — real HF loading + scoring lands in v0.2. The filter
+    # function below IS shipped (lib.hle.filter_text_only) and tested by
+    # tests/test_hle_filter.py so v0.2 just wires the loader.
+    if flt == "text-only" and filter_text_only is None:
+        print(f"  [warn] lib.hle not importable — v0.2 loader will need it")
     print(f"  [v0.1 scaffold] real benchmark execution not yet wired")
     print(f"  — for v0.1, manually run the subset against the target's backend")
     print(f"  — record results, then write the stamp by hand or wait for v0.2")
+    print(f"  — see docs/why-hle.md for rationale + calibration")
 
     return (None, None, {"status": "v0.1_scaffold_only", "filter": flt})
 
