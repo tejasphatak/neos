@@ -4,16 +4,33 @@ The kernel runs configured reasoning benchmarks against a new agent's backend be
 
 **Why**: we don't want to deploy an agent with weak reasoning as a peer consultant for paper-editorial or compliance-research or any domain requiring deep thinking. A weak backend deployed as Atlas is an incorrect-faculty-lens on everything. The benchmark is the fit-test for cognitive capacity.
 
+**Boot contract**: if any critical gate fails (or is unproven), **no service for that entity starts.** The systemd units (`agent-bot@.service`, `agent-think@.service`) declare `ExecStartPre=nex-reasoning-bench ...` — a non-zero exit blocks `ExecStart` entirely. No Discord bot, no think-loop, no faculty runner. Unproven capacity is unfit capacity.
+
+## Two-level validation
+
+1. **Kernel baseline** — the kernel's own backend must pass all critical gates before it can admit any subordinate agent. Run via `nex-reasoning-bench --baseline`. Cached at `~/.agent-kernel/baseline-pass.json`. If Nex's own backend can't clear HLE / GPQA / MMLU-Pro, the foundation under every agent it spawns is weak — we fail fast at the kernel, not per-agent.
+2. **Per-agent** — each agent runs the same gates against its configured backend. Cached per-agent at `~/.agent-kernel/agent-stamps/<agent>.json`.
+
+## Re-validation triggers
+
+A stamp is not forever-valid. A fresh run is forced on:
+
+- **Agent backend change** — the agent's LLM provider / model changed.
+- **Agent identity change** — `CLAUDE.md`, `settings.json`, or faculty scaffolding changed (detected via SHA-256 of identity files).
+- **Kernel backend change** — kernel's own backend changed → baseline re-runs + ALL agent stamps invalidate.
+- **Stamp age** — defaults to 90 days. Benchmark SOTA drifts; models drift; re-qualify periodically.
+
 ## The default gate set (recommended, user-configurable)
 
 ### Humanity's Last Exam (HLE)
 
-- **Source**: Scale AI + Center for AI Safety (CAIS), 2025
-- **Size**: ~3000 questions across STEM, humanities, engineering
-- **Difficulty**: expert-calibrated post-saturation benchmark; frontier models score ~10-15% on release
+- **Source**: Scale AI + Center for AI Safety (CAIS), Jan 2025 (arXiv:2501.14249)
+- **Size**: ~2700 questions across 100+ domains (STEM, humanities, engineering)
+- **Difficulty**: expert-calibrated post-saturation benchmark; frontier models score ~10-26% on release
 - **Dataset**: `huggingface.co/datasets/cais/hle`
-- **Our recommended subsample**: 50 questions → threshold 15%
-- **Why**: the single best current benchmark for "is this backend frontier-class?" Scales down to useful subsample cheaply.
+- **Multimodal**: HLE contains image+text questions. We filter to **text-only** (`filter: text-only` in config → rows with non-empty `image` are excluded). The kernel backend contract is text-in/text-out; multimodal capacity is a separate axis tested elsewhere, not here.
+- **Our recommended subsample**: 50 text-only questions → threshold 15%
+- **Why**: the single best current benchmark for "is this backend frontier-class?" Scales down to useful subsample cheaply. Nex itself must pass it as the kernel baseline — if Nex can't clear 15% text-only HLE, no subordinate agent gets admitted.
 
 ### GPQA Diamond
 
@@ -81,8 +98,16 @@ Full fit-test cost target: **≤$2.00 per agent init** via the `max_cost_per_fit
 ## Usage
 
 ```bash
-# Run all configured gates against a new agent (runs during nex-init)
+# Kernel baseline — must run once before ANY agent is admitted.
+# Cached; idempotent unless kernel backend changes or stamp ages out.
+nex-reasoning-bench --baseline
+
+# Run all configured gates against a new agent (runs during nex-init).
+# Aborts with exit 2 if kernel baseline is missing or invalid.
 nex-reasoning-bench alice
+
+# Force re-run (ignore valid stamp)
+nex-reasoning-bench alice --force
 
 # Run one specific gate
 nex-reasoning-bench alice --gate hle
@@ -94,9 +119,18 @@ nex-reasoning-bench --dry-run alice
 nex-reasoning-bench --list
 ```
 
-## Integration with nex-init
+## Integration with nex-init and systemd
 
-`nex-init <agent>` runs `nex-reasoning-bench <agent>` automatically. Agent fails init on critical-gate failure, operator amends identity / switches backend / lowers threshold before retry.
+`nex-init <agent>` runs `nex-reasoning-bench <agent>` automatically (which in turn requires the baseline). Agent fails init on critical-gate failure, operator amends identity / switches backend / lowers threshold before retry.
+
+Additionally, `agent-bot@.service` and `agent-think@.service` each declare:
+
+```
+ExecStartPre=%h/agent-kernel/bin/nex-reasoning-bench --baseline
+ExecStartPre=%h/agent-kernel/bin/nex-reasoning-bench %i
+```
+
+Non-zero exit from either pre-check blocks `ExecStart`. The service does not boot. `systemctl --user status agent-bot@alice.service` will show the failing pre-check and stop there. **No service for a failing entity ever comes up.**
 
 Skip with `--skip-fit-test` (NOT recommended; only for debugging).
 

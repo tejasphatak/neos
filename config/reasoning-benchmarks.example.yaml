@@ -10,12 +10,16 @@
 reasoning_gates:
   # Humanity's Last Exam — frontier reasoning benchmark
   # https://huggingface.co/datasets/cais/hle
-  # Released: Scale AI + CAIS, 2025
-  # Full run: ~3000 questions across STEM/humanities/engineering
+  # Released: Scale AI + CAIS, Jan 2025 (arXiv:2501.14249)
+  # Full run: ~2700 questions across 100+ domains.
+  # HLE is multimodal (image+text questions exist). We filter to text-only
+  # for this gate — the kernel backend contract is text-in/text-out and
+  # multimodal capacity is a separate axis tested elsewhere.
   - name: hle
     source: huggingface:cais/hle
-    subsample: 50                       # random subset for smoke-test; full=3000
-    threshold_pct: 15                   # ≥15% → gate passes (frontier models score ~10-15%)
+    filter: text-only                   # drop rows where `image` field is non-empty
+    subsample: 50                       # random subset of text-only pool; full text-only ≈ 2000q
+    threshold_pct: 15                   # ≥15% → gate passes (frontier models score ~10-26%)
     weight: critical                    # must pass for boot
     scoring: llm-as-judge
     judge_model: sonnet                 # cheaper judge; can use opus if budget allows
@@ -57,4 +61,21 @@ optional_gates:
 
 # Budget protection — fit-test cost cap
 max_cost_per_fit_test_usd: 2.00
-# (Full HLE on Opus: ~$30-50. Subsample of 50 on Sonnet: ~$0.50-1.00. Stay cheap.)
+# (Full HLE on Opus: ~$300-500. Subsample of 50 on Sonnet: ~$0.50-1.00. Stay cheap.)
+
+# Kernel baseline — the kernel itself must clear these before it can admit
+# ANY subordinate agent. Run via `nex-reasoning-bench --baseline`.
+# Rationale: if the kernel's own backend can't reason, every agent it spawns
+# is built on a weak foundation. Baseline is a necessary precondition.
+kernel_baseline:
+  required_gates: [hle, gpqa-diamond, mmlu-pro]   # all critical gates apply to the kernel itself
+  stamp_path: ~/.agent-kernel/baseline-pass.json  # written when baseline passes; checked before every agent boot
+
+# Re-validation triggers — when to force a fresh benchmark run for an agent.
+# Prevents silent degradation: an agent that passed once is NOT forever-valid
+# if its backend or identity changed.
+revalidation_triggers:
+  - agent_backend_change        # user switched the agent's LLM backend
+  - agent_identity_change       # CLAUDE.md / system prompt / faculties edited
+  - kernel_backend_change       # the kernel's own backend changed (re-runs baseline + all agents)
+  - stamp_age_days: 90          # stamps expire after 90 days

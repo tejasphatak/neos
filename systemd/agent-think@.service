@@ -6,6 +6,9 @@ After=default.target
 Type=simple
 Environment=AGENT_NAME=%i
 Environment=NEX_THINK_MODEL=sonnet
+# Hard gate: baseline + per-agent reasoning stamp must be valid before cognition starts.
+ExecStartPre=%h/agent-kernel/bin/nex-reasoning-bench --baseline
+ExecStartPre=%h/agent-kernel/bin/nex-reasoning-bench %i
 ExecStart=%h/agent-kernel/bin/nex-think.sh
 Restart=on-failure
 RestartSec=30s

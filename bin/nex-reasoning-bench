@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-nex-reasoning-bench — run reasoning benchmarks against an agent's backend as a
-pre-boot quality gate. Agent enters production only if ALL `critical`-weight
-benchmarks pass threshold.
+nex-reasoning-bench — run reasoning benchmarks as a pre-boot quality gate.
 
-Design choice: pluggable benchmark sources (HuggingFace datasets / GitHub JSON
-/ local files). Config-driven, not hardcoded. Users can add their own.
+Two modes:
+  1. Kernel baseline (`--baseline`) — the kernel's own backend must clear
+     all `critical` gates before ANY agent can be admitted. One pass per
+     kernel-backend; cached in `~/.agent-kernel/baseline-pass.json`.
+  2. Agent gate (`<agent-name>`) — each subordinate agent clears its own
+     gates against its configured backend. Pass is cached per-agent and
+     re-run on backend / identity change, or after `stamp_age_days`.
 
-Usage:
-  nex-reasoning-bench <agent-name>                  # run all gates from config
-  nex-reasoning-bench <agent-name> --gate <name>    # run one benchmark
-  nex-reasoning-bench --list                        # show configured gates
-  nex-reasoning-bench --dry-run <agent>             # no LLM calls; just report config
+HARD CONTRACT: if any gate fails, the failing entity (kernel or agent) does
+NOT boot. No systemd unit starts, no Discord bot starts, no think-loop
+starts. Caller (nex-init, agent-bot@.service) MUST check exit code.
 
-v0.1: scaffold. Actual HuggingFace dataset loading + scoring is sketched;
-working implementations for HLE / GPQA / MMLU-Pro shipped in v0.2.
+v0.1: scaffolding. Actual HuggingFace dataset loading + LLM-as-judge scoring
+shipped in v0.2. In v0.1, `--dry-run` reports configuration; a real run
+returns `v0.1_scaffold_only` and exits non-zero so no service boots on
+untested capacity.
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -30,6 +35,10 @@ except ImportError:
 KERNEL = Path(__file__).resolve().parent.parent
 CONFIG = KERNEL / "config" / "reasoning-benchmarks.yaml"
 CONFIG_EXAMPLE = KERNEL / "config" / "reasoning-benchmarks.example.yaml"
+STATE_DIR = Path.home() / ".agent-kernel"
+BASELINE_STAMP = STATE_DIR / "baseline-pass.json"
+AGENT_STAMPS = STATE_DIR / "agent-stamps"
+LOG_DIR = STATE_DIR / "reasoning-bench-logs"
 
 
 def load_config():
@@ -41,51 +50,132 @@ def load_config():
         return yaml.safe_load(f)
 
 
+def identity_fingerprint(agent_name):
+    """Hash an agent's identity-relevant files so we detect changes."""
+    agent_dir = STATE_DIR / "agents" / agent_name
+    h = hashlib.sha256()
+    for rel in ("CLAUDE.md", "settings.json", "backend.txt"):
+        p = agent_dir / rel
+        if p.exists():
+            h.update(rel.encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def kernel_fingerprint():
+    """Hash the kernel's own backend choice."""
+    bp = STATE_DIR / "kernel-backend.txt"
+    if bp.exists():
+        return hashlib.sha256(bp.read_bytes()).hexdigest()[:16]
+    return "default"
+
+
 def list_gates(cfg):
     print("Configured reasoning gates:")
     for g in cfg.get("reasoning_gates", []):
-        print(f"  {g['name']:<16} [{g.get('weight','high'):<8}] threshold={g.get('threshold_pct','?')}% subsample={g.get('subsample','?')}")
+        flt = f" filter={g['filter']}" if g.get("filter") else ""
+        print(f"  {g['name']:<16} [{g.get('weight','high'):<8}] "
+              f"threshold={g.get('threshold_pct','?')}% "
+              f"subsample={g.get('subsample','?')}{flt}")
     if cfg.get("optional_gates"):
         print("\nOptional gates (opt-in):")
         for g in cfg["optional_gates"]:
             print(f"  {g['name']:<16} threshold={g.get('threshold_pct','?')}%")
+    kb = cfg.get("kernel_baseline", {})
+    if kb:
+        print(f"\nKernel baseline: {','.join(kb.get('required_gates', []))}")
+    rv = cfg.get("revalidation_triggers", [])
+    if rv:
+        print(f"Revalidation triggers: {rv}")
 
 
-def run_gate(agent_name, gate_cfg, dry_run=False):
-    """Run one benchmark gate. Returns (passed, score_pct, details)."""
+def run_gate(target, gate_cfg, dry_run=False):
+    """Run one benchmark gate. Returns (passed, score_pct, details).
+
+    passed=None with status='v0.1_scaffold_only' means NOT YET IMPLEMENTED.
+    Caller must treat that as failure for boot-gate purposes — unproven
+    capacity is unfit capacity.
+    """
     name = gate_cfg["name"]
-    source = gate_cfg.get("source", "")
     subsample = gate_cfg.get("subsample", 50)
     threshold = gate_cfg.get("threshold_pct", 0)
+    flt = gate_cfg.get("filter")
 
     if dry_run:
-        print(f"  [dry-run] would run {name} on {agent_name}: subsample={subsample}, threshold={threshold}%")
+        flt_note = f", filter={flt}" if flt else ""
+        print(f"  [dry-run] {name} on {target}: subsample={subsample}, "
+              f"threshold={threshold}%{flt_note}")
         return (True, None, {"dry_run": True})
 
-    # Load dataset — v0.1 scaffold, real HF / github loading in v0.2
-    print(f"  running {name} ({subsample} questions, threshold {threshold}%)...")
+    print(f"  running {name} ({subsample} questions, threshold {threshold}%)"
+          f"{' [text-only]' if flt == 'text-only' else ''}...")
 
-    # Placeholder: in v0.2 this branches on source format
-    # if source.startswith("huggingface:"):
-    #     from datasets import load_dataset
-    #     ds = load_dataset(source[len("huggingface:"):])
-    # elif source.startswith("github:"):
-    #     ...
+    # v0.1 scaffold — real HF loading + scoring lands in v0.2.
+    # For HLE specifically, v0.2 must filter rows with non-empty `image` field
+    # when filter: text-only.
+    print(f"  [v0.1 scaffold] real benchmark execution not yet wired")
+    print(f"  — for v0.1, manually run the subset against the target's backend")
+    print(f"  — record results, then write the stamp by hand or wait for v0.2")
 
-    print(f"  [v0.1 scaffold] actual benchmark execution not implemented — roadmap")
-    print(f"  For v0.1, use manual eval: download dataset, run subset against")
-    print(f"  `nex-invoke agent {agent_name}`, compute pass-rate, compare to threshold.")
-    print(f"  v0.2 will ship full automated scoring.")
+    return (None, None, {"status": "v0.1_scaffold_only", "filter": flt})
 
-    return (None, None, {"status": "v0.1_scaffold_only"})
+
+def write_stamp(stamp_path, target, gates_results, fingerprint):
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_path.write_text(json.dumps({
+        "target": target,
+        "fingerprint": fingerprint,
+        "passed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "gates": gates_results,
+    }, indent=2))
+
+
+def stamp_valid(stamp_path, expected_fingerprint, max_age_days):
+    if not stamp_path.exists():
+        return False, "no-stamp"
+    try:
+        data = json.loads(stamp_path.read_text())
+    except Exception:
+        return False, "stamp-corrupt"
+    if data.get("fingerprint") != expected_fingerprint:
+        return False, "fingerprint-changed"
+    try:
+        passed_at = time.strptime(data["passed_at"], "%Y-%m-%dT%H:%M:%SZ")
+        age_days = (time.time() - time.mktime(passed_at)) / 86400
+        if age_days > max_age_days:
+            return False, f"stamp-expired ({int(age_days)}d > {max_age_days}d)"
+    except Exception:
+        return False, "stamp-timestamp-unreadable"
+    return True, "ok"
+
+
+def run_gates(target, gates, dry_run):
+    critical_failed = 0
+    unproven = 0
+    results = []
+    for g in gates:
+        passed, score, details = run_gate(target, g, dry_run=dry_run)
+        results.append({
+            "gate": g["name"], "weight": g.get("weight", "high"),
+            "passed": passed, "score": score, **details,
+        })
+        if passed is False and g.get("weight") == "critical":
+            critical_failed += 1
+        if passed is None and not dry_run and g.get("weight") == "critical":
+            unproven += 1
+    return results, critical_failed, unproven
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("agent", nargs="?")
+    p.add_argument("--baseline", action="store_true",
+                   help="run kernel-baseline gates against the kernel's own backend")
     p.add_argument("--gate", help="run a single gate by name")
     p.add_argument("--list", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="ignore valid stamp; re-run gates")
     args = p.parse_args()
 
     cfg = load_config()
@@ -94,8 +184,60 @@ def main():
         list_gates(cfg)
         return
 
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    rv = cfg.get("revalidation_triggers", []) or []
+    max_age_days = 90
+    for t in rv:
+        if isinstance(t, dict) and "stamp_age_days" in t:
+            max_age_days = t["stamp_age_days"]
+
+    # Kernel baseline mode
+    if args.baseline:
+        target = "kernel"
+        kb = cfg.get("kernel_baseline", {}) or {}
+        required_names = set(kb.get("required_gates", []))
+        gates = [g for g in cfg.get("reasoning_gates", [])
+                 if g["name"] in required_names]
+        fp = kernel_fingerprint()
+
+        if not args.force:
+            ok, reason = stamp_valid(BASELINE_STAMP, fp, max_age_days)
+            if ok:
+                print(f"kernel baseline: PASS (cached, fingerprint={fp})")
+                return
+
+        print(f"running kernel baseline ({len(gates)} gate(s), "
+              f"fingerprint={fp})...")
+        results, critical_failed, unproven = run_gates(target, gates, args.dry_run)
+
+        stamp = LOG_DIR / f"baseline-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+        stamp.write_text(json.dumps({"target": target, "results": results}, indent=2))
+        print(f"\nlog: {stamp}")
+
+        if critical_failed > 0 or unproven > 0:
+            why = "critical gate failure" if critical_failed else "unproven capacity (v0.1 scaffold)"
+            print(f"\nkernel baseline FAILED — {why}")
+            print("no agent boots permitted. Fix kernel backend or lower thresholds.")
+            sys.exit(1)
+
+        if not args.dry_run:
+            write_stamp(BASELINE_STAMP, target, results, fp)
+            print(f"\nkernel baseline PASSED — stamp: {BASELINE_STAMP}")
+        return
+
+    # Agent mode
     if not args.agent:
-        p.error("agent name required (or use --list)")
+        p.error("agent name required (or use --baseline / --list)")
+
+    # Check kernel baseline first — no agent admits on a failed kernel.
+    if not args.dry_run:
+        ok, reason = stamp_valid(BASELINE_STAMP, kernel_fingerprint(), max_age_days)
+        if not ok:
+            print(f"kernel baseline not valid ({reason}).")
+            print(f"run `nex-reasoning-bench --baseline` before admitting agents.")
+            sys.exit(2)
 
     gates = cfg.get("reasoning_gates", [])
     if args.gate:
@@ -104,25 +246,30 @@ def main():
             print(f"error: no gate named '{args.gate}'", file=sys.stderr)
             sys.exit(1)
 
-    critical_failed = 0
-    all_results = []
-    for g in gates:
-        passed, score, details = run_gate(args.agent, g, dry_run=args.dry_run)
-        all_results.append({"gate": g["name"], "weight": g.get("weight", "high"), "passed": passed, "score": score, **details})
-        if passed is False and g.get("weight") == "critical":
-            critical_failed += 1
+    fp = identity_fingerprint(args.agent)
+    stamp_path = AGENT_STAMPS / f"{args.agent}.json"
 
-    # Log
-    log_dir = Path.home() / ".agent-kernel" / "reasoning-bench-logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    import time
-    log_file = log_dir / f"{args.agent}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
-    log_file.write_text(json.dumps({"agent": args.agent, "results": all_results}, indent=2))
+    if not args.force and not args.gate:
+        ok, reason = stamp_valid(stamp_path, fp, max_age_days)
+        if ok:
+            print(f"{args.agent}: PASS (cached, fingerprint={fp})")
+            return
+
+    results, critical_failed, unproven = run_gates(args.agent, gates, args.dry_run)
+
+    log_file = LOG_DIR / f"{args.agent}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+    log_file.write_text(json.dumps({"agent": args.agent, "results": results}, indent=2))
     print(f"\nlog: {log_file}")
 
-    if critical_failed > 0:
-        print("FAILED critical gates — agent not cleared for boot")
+    if critical_failed > 0 or unproven > 0:
+        why = "critical gate failure" if critical_failed else "unproven capacity (v0.1 scaffold)"
+        print(f"\n{args.agent} FAILED reasoning gates — {why}")
+        print("agent NOT cleared for boot. No services will start.")
         sys.exit(1)
+
+    if not args.dry_run and not args.gate:
+        write_stamp(stamp_path, args.agent, results, fp)
+        print(f"\n{args.agent} PASSED — stamp: {stamp_path}")
 
 
 if __name__ == "__main__":

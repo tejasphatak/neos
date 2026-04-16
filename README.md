@@ -8,6 +8,21 @@ Four primitives compose every cognitive step: **trigger → attention → queue 
 
 **v0.1 — reference implementation.** Proven working with a 2-agent deployment (Nexus + Atlas) on a shared Claude Max subscription over ~4 hours of live operation. First published release. Expect sharp edges.
 
+## ⚠️ Dumb ways to die: use a dumb LLM
+
+> 🎵 *Dumb ways to diiiie, so many dumb ways to diiiie...* 🎵
+>
+> - Wire GPT-2 into the kernel and wonder why your "autonomous research agent" keeps recommending you invest your savings in **"tokens"** (it means BPE tokens, it really does).
+> - Use a 7B quant that hallucinates a `rm -rf /` into your shared queue because it confused "clean up tasks" with "clean up the filesystem."
+> - Plug in a model that confidently signs legal documents as **"Sincerely, Assistant"** on your behalf.
+> - Let a toy LLM play `Lawyer` faculty, ignore the contract clause, and discover `contractual penalty` is not, in fact, a Pokémon type.
+> - Pick a model that thinks HLE stands for "High-Level English" and scores 2% on it, then merrily advises the principal on tensor algebra.
+> - Run a Discord bot backed by a dumb LLM that, when asked "are you sure?", replies "yes 🙂" to every single destructive action. Every. Single. One.
+>
+> **That is why `nex-reasoning-bench` exists.** The kernel refuses to boot an agent whose backend can't clear reasoning gates (HLE text-only, GPQA Diamond, MMLU-Pro). No baseline pass → no services start. No agent stamp → no Discord bot, no think-loop, no faculty spawn. Unproven capacity is unfit capacity.
+>
+> **Please.** Use an adult LLM. Your queue, your principal, and your rm-rf-less filesystem will thank you.
+
 ## What this is
 
 If you want to run multiple persistent LLM agents — each with distinct identity, memory, Discord presence, and continuous cognition — without reinventing the coordination fabric each time, this is a starter kit. You bring the Claude Code CLI (substrate); we provide the kernel around it.

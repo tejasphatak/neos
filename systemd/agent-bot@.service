@@ -5,6 +5,10 @@ After=default.target
 [Service]
 Type=simple
 Environment=AGENT_NAME=%i
+# Hard gate: baseline + per-agent reasoning stamp must be valid.
+# If either fails, the service does NOT start — no agent boots on unproven capacity.
+ExecStartPre=%h/agent-kernel/bin/nex-reasoning-bench --baseline
+ExecStartPre=%h/agent-kernel/bin/nex-reasoning-bench %i
 ExecStart=/usr/bin/python3 %h/agent-kernel/bin/agent-bot.py --agent %i
 Restart=on-failure
 RestartSec=10s
