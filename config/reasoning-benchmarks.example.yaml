@@ -1,0 +1,60 @@
+# agent-kernel — reasoning benchmark configuration for pre-boot gating.
+#
+# The agent kernel won't let an agent into production until the backend LLM
+# clears configured reasoning thresholds. Backend must demonstrate deep
+# reasoning capacity (Opus / GPT-4o / Gemini Pro class) before we trust it
+# with autonomous work in consultation domains.
+#
+# Pluggable — add / remove benchmarks as they evolve. Not hardcoded.
+
+reasoning_gates:
+  # Humanity's Last Exam — frontier reasoning benchmark
+  # https://huggingface.co/datasets/cais/hle
+  # Released: Scale AI + CAIS, 2025
+  # Full run: ~3000 questions across STEM/humanities/engineering
+  - name: hle
+    source: huggingface:cais/hle
+    subsample: 50                       # random subset for smoke-test; full=3000
+    threshold_pct: 15                   # ≥15% → gate passes (frontier models score ~10-15%)
+    weight: critical                    # must pass for boot
+    scoring: llm-as-judge
+    judge_model: sonnet                 # cheaper judge; can use opus if budget allows
+
+  # GPQA Diamond — graduate-level physics/chem/bio questions
+  # https://huggingface.co/datasets/Idavidrein/gpqa
+  # Expert-calibrated; grad-student-plus difficulty
+  - name: gpqa-diamond
+    source: huggingface:Idavidrein/gpqa
+    subset: diamond
+    subsample: 30
+    threshold_pct: 40                   # SOTA ~60%; 40% filters-out mid-tier models
+    weight: critical
+    scoring: exact-match-multichoice
+
+  # MMLU-Pro — multi-discipline multiple-choice, enhanced MMLU
+  # https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro
+  - name: mmlu-pro
+    source: huggingface:TIGER-Lab/MMLU-Pro
+    subsample: 100
+    threshold_pct: 55                   # Opus ~75%; mid-models ~55%; floor at 55
+    weight: high
+    scoring: exact-match-multichoice
+
+# Optional additional gates (not required; users opt in)
+optional_gates:
+  # ARC-AGI — abstract reasoning, pattern recognition
+  # https://github.com/fchollet/ARC
+  - name: arc-agi
+    source: github:fchollet/ARC
+    subsample: 20
+    threshold_pct: 30
+
+  # BigBench-Hard — broad reasoning subset
+  - name: bbh
+    source: huggingface:lukaemon/bbh
+    subsample: 50
+    threshold_pct: 50
+
+# Budget protection — fit-test cost cap
+max_cost_per_fit_test_usd: 2.00
+# (Full HLE on Opus: ~$30-50. Subsample of 50 on Sonnet: ~$0.50-1.00. Stay cheap.)

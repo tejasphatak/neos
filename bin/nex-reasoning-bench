@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+nex-reasoning-bench — run reasoning benchmarks against an agent's backend as a
+pre-boot quality gate. Agent enters production only if ALL `critical`-weight
+benchmarks pass threshold.
+
+Design choice: pluggable benchmark sources (HuggingFace datasets / GitHub JSON
+/ local files). Config-driven, not hardcoded. Users can add their own.
+
+Usage:
+  nex-reasoning-bench <agent-name>                  # run all gates from config
+  nex-reasoning-bench <agent-name> --gate <name>    # run one benchmark
+  nex-reasoning-bench --list                        # show configured gates
+  nex-reasoning-bench --dry-run <agent>             # no LLM calls; just report config
+
+v0.1: scaffold. Actual HuggingFace dataset loading + scoring is sketched;
+working implementations for HLE / GPQA / MMLU-Pro shipped in v0.2.
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+KERNEL = Path(__file__).resolve().parent.parent
+CONFIG = KERNEL / "config" / "reasoning-benchmarks.yaml"
+CONFIG_EXAMPLE = KERNEL / "config" / "reasoning-benchmarks.example.yaml"
+
+
+def load_config():
+    path = CONFIG if CONFIG.exists() else CONFIG_EXAMPLE
+    if not yaml:
+        print("error: pyyaml not installed — pip install pyyaml", file=sys.stderr)
+        sys.exit(3)
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def list_gates(cfg):
+    print("Configured reasoning gates:")
+    for g in cfg.get("reasoning_gates", []):
+        print(f"  {g['name']:<16} [{g.get('weight','high'):<8}] threshold={g.get('threshold_pct','?')}% subsample={g.get('subsample','?')}")
+    if cfg.get("optional_gates"):
+        print("\nOptional gates (opt-in):")
+        for g in cfg["optional_gates"]:
+            print(f"  {g['name']:<16} threshold={g.get('threshold_pct','?')}%")
+
+
+def run_gate(agent_name, gate_cfg, dry_run=False):
+    """Run one benchmark gate. Returns (passed, score_pct, details)."""
+    name = gate_cfg["name"]
+    source = gate_cfg.get("source", "")
+    subsample = gate_cfg.get("subsample", 50)
+    threshold = gate_cfg.get("threshold_pct", 0)
+
+    if dry_run:
+        print(f"  [dry-run] would run {name} on {agent_name}: subsample={subsample}, threshold={threshold}%")
+        return (True, None, {"dry_run": True})
+
+    # Load dataset — v0.1 scaffold, real HF / github loading in v0.2
+    print(f"  running {name} ({subsample} questions, threshold {threshold}%)...")
+
+    # Placeholder: in v0.2 this branches on source format
+    # if source.startswith("huggingface:"):
+    #     from datasets import load_dataset
+    #     ds = load_dataset(source[len("huggingface:"):])
+    # elif source.startswith("github:"):
+    #     ...
+
+    print(f"  [v0.1 scaffold] actual benchmark execution not implemented — roadmap")
+    print(f"  For v0.1, use manual eval: download dataset, run subset against")
+    print(f"  `nex-invoke agent {agent_name}`, compute pass-rate, compare to threshold.")
+    print(f"  v0.2 will ship full automated scoring.")
+
+    return (None, None, {"status": "v0.1_scaffold_only"})
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("agent", nargs="?")
+    p.add_argument("--gate", help="run a single gate by name")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    args = p.parse_args()
+
+    cfg = load_config()
+
+    if args.list:
+        list_gates(cfg)
+        return
+
+    if not args.agent:
+        p.error("agent name required (or use --list)")
+
+    gates = cfg.get("reasoning_gates", [])
+    if args.gate:
+        gates = [g for g in gates if g["name"] == args.gate]
+        if not gates:
+            print(f"error: no gate named '{args.gate}'", file=sys.stderr)
+            sys.exit(1)
+
+    critical_failed = 0
+    all_results = []
+    for g in gates:
+        passed, score, details = run_gate(args.agent, g, dry_run=args.dry_run)
+        all_results.append({"gate": g["name"], "weight": g.get("weight", "high"), "passed": passed, "score": score, **details})
+        if passed is False and g.get("weight") == "critical":
+            critical_failed += 1
+
+    # Log
+    log_dir = Path.home() / ".agent-kernel" / "reasoning-bench-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    import time
+    log_file = log_dir / f"{args.agent}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+    log_file.write_text(json.dumps({"agent": args.agent, "results": all_results}, indent=2))
+    print(f"\nlog: {log_file}")
+
+    if critical_failed > 0:
+        print("FAILED critical gates — agent not cleared for boot")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
