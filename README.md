@@ -61,6 +61,8 @@ Dependency-free. Covers: config schema, HLE text-only filter against synthetic f
 
 v0.1 reference implementation. Proven working with a 2-agent deployment on a shared Claude Max subscription. Experimental research software. Sharp edges.
 
+**In production use.** The ongoing autonomous work on [**Synapse**](https://github.com/tejasphatak/Synapse) (distributed WebGPU LLM inference) and [**webmind-research**](https://github.com/tejasphatak/webmind-research) (open research notes, paper drafts, SFCA experiments) is driven through this kernel — faculty-routed code review, attention-gated Discord consultation, continuous cognition maintaining context across sessions, and peer editorial via stream-JSON. neos is dogfood before it's a framework.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
