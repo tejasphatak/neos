@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent-kernel continuous cognition for %i
+After=default.target
+
+[Service]
+Type=simple
+Environment=AGENT_NAME=%i
+Environment=NEX_THINK_MODEL=sonnet
+ExecStart=%h/agent-kernel/bin/nex-think.sh
+Restart=on-failure
+RestartSec=30s
+StandardOutput=append:%h/.agent-kernel/logs/%i-think.log
+StandardError=append:%h/.agent-kernel/logs/%i-think.log
+
+[Install]
+WantedBy=default.target

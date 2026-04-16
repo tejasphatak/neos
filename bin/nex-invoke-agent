@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+nex-invoke-atlas — agent-to-agent channel via stream-json.
+
+Spawns `claude -p --resume <atlas-session> --input-format=stream-json --output-format=stream-json`
+with Atlas's identity scaffolding (CLAUDE.md + settings + workspace + memory).
+Writes the prompt as a JSON user-message frame to stdin, reads JSON frames from
+stdout, extracts the assistant response, returns it.
+
+Usage:
+  nex-invoke-atlas "<prompt>"                # return stdout to caller
+  nex-invoke-atlas --post "<prompt>"         # also post response to Discord via Atlas webhook
+  nex-invoke-atlas --mention-tejas "<prompt>"  # @tejas in Discord post (alert-level)
+
+Respects nex-attention gate — if Nex's attention is CLOSED and --force not set, skips.
+Session-id persists at ~/.agent-kernel/threads/<agent>/state/session-id.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+ATLAS_DIR = HOME / ".nexus" / "threads" / "atlas"
+SESSION_ID_FILE = ATLAS_DIR / "state" / "session-id"
+SECRETS = HOME / ".claude" / "secrets" / "discord.json"
+TIMEOUT_SEC = int(os.environ.get("NEX_ATLAS_TIMEOUT", "120"))
+
+
+def load_session_id():
+    if not SESSION_ID_FILE.exists():
+        return None
+    sid = SESSION_ID_FILE.read_text().strip()
+    return sid or None
+
+
+def save_session_id(sid):
+    SESSION_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SESSION_ID_FILE.write_text(sid + "\n")
+
+
+def invoke(prompt_text):
+    """One turn against Atlas. Returns {result, session_id, cost_usd, duration_ms}."""
+    sid = load_session_id()
+    cmd = [
+        "claude", "-p",
+        "--verbose",
+        "--add-dir", str(ATLAS_DIR / "workspace"),
+        "--settings", str(ATLAS_DIR / "settings.json"),
+        "--append-system-prompt-file", str(ATLAS_DIR / "CLAUDE.md"),
+        "--input-format=stream-json",
+        "--output-format=stream-json",
+    ]
+    if sid:
+        cmd += ["--resume", sid]
+    frame = {"type": "user", "message": {"role": "user", "content": prompt_text}}
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ATLAS_DIR / "workspace"),
+        input=json.dumps(frame) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SEC,
+    )
+    # Parse JSON frames; grab the "result" subtype=success frame
+    result = {"result": "", "session_id": sid, "cost_usd": 0, "duration_ms": 0, "error": None}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") == "result":
+            result["result"] = d.get("result") or ""
+            result["session_id"] = d.get("session_id") or sid
+            result["cost_usd"] = d.get("total_cost_usd") or 0
+            result["duration_ms"] = d.get("duration_ms") or 0
+            if d.get("is_error"):
+                result["error"] = d.get("errors") or []
+    if result["session_id"] and result["session_id"] != sid:
+        save_session_id(result["session_id"])
+    if proc.returncode != 0 and not result["result"]:
+        result["error"] = f"exit={proc.returncode} stderr={proc.stderr[:300]}"
+    return result
+
+
+def post_to_discord(text, mention_tejas=False):
+    """Post Atlas's response via Atlas webhook."""
+    with open(SECRETS) as f:
+        secrets = json.load(f)
+    wh_id = secrets.get("webhook_atlas_id")
+    wh_token = secrets.get("webhook_atlas_token")
+    tejas_id = secrets.get("tejas_user_id")
+    if not (wh_id and wh_token):
+        print("warning: no Atlas webhook configured", file=sys.stderr)
+        return
+    body = text[:1900]
+    if len(text) > 1900:
+        body += "\n\n[truncated]"
+    if mention_tejas and tejas_id:
+        body = f"<@{tejas_id}> {body}"
+    url = f"https://discord.com/api/v10/webhooks/{wh_id}/{wh_token}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"content": body}).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "nex-invoke-atlas"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"warning: Discord post failed: {e!r}", file=sys.stderr)
+
+
+def check_attention(content, kind="atlas_consult"):
+    """Consult nex-attention before invoking (Nex's quota-steering)."""
+    nex_attn = HOME / "nexus" / "bin" / "nex-attention"
+    if not nex_attn.exists():
+        return True
+    try:
+        rc = subprocess.run(
+            [str(nex_attn), "dispatchable", "--kind", kind, "--content", content or ""],
+            timeout=3,
+        ).returncode
+        return rc == 0
+    except Exception:
+        return True
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--post", action="store_true", help="post response to Discord via Atlas webhook")
+    p.add_argument("--mention-tejas", action="store_true", help="@tejas in the Discord post")
+    p.add_argument("--force", action="store_true", help="bypass nex-attention gate")
+    p.add_argument("prompt", help="prompt for Atlas")
+    args = p.parse_args()
+
+    if not args.force and not check_attention(args.prompt):
+        print("nex-attention gate CLOSED — skipping Atlas invocation (use --force to override)", file=sys.stderr)
+        sys.exit(3)
+
+    r = invoke(args.prompt)
+    if r["error"]:
+        print(f"atlas error: {r['error']}", file=sys.stderr)
+    print(r["result"])
+
+    if args.post and r["result"]:
+        post_to_discord(r["result"], mention_tejas=args.mention_tejas)
+
+    sys.exit(0 if not r["error"] else 1)
+
+
+if __name__ == "__main__":
+    main()

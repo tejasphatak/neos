@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+nex-attention — agent-owned attention gate.
+
+State: OPEN | GATED | CLOSED
+  OPEN    — all events dispatch (default)
+  GATED   — only bypass-kinds + explicit mentions dispatch; rest queue silently
+  CLOSED  — only bypass-kinds dispatch; all other events queue silently
+
+Bypass-kinds (hardcoded invariant per contract §IV): alert, gate_blocker, ethics, mention
+These always pass regardless of state — safety signals cannot be silenced.
+
+Auto-expire: every state has `expires_at`. When wall-clock passes it, watchdog
+resets to OPEN. Prevents silent-death if agent forgets to reopen.
+
+Usage:
+  nex-attention status                              # print current state
+  nex-attention open                                # full availability (no focus)
+  nex-attention gate --focus "X" --for 20           # gated for 20 min
+  nex-attention close --focus "X" --for 30          # closed (bypass-only) 30 min
+  nex-attention check                               # exit 0 if caller should dispatch, 1 if gated
+
+  nex-attention dispatchable --kind <k> [--mention]  # exit 0 if this event should dispatch
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+HOME = Path.home()
+STATE_PATH = HOME / ".nexus" / "state" / "attention.json"
+BYPASS_KINDS = ["alert", "gate_blocker", "ethics", "mention"]
+DEFAULT_FOCUS_MIN = 30
+MAX_FOCUS_MIN = 240  # 4h hard cap — even if agent asks longer, watchdog resets
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def now_ts():
+    return time.time()
+
+def load():
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_PATH) as f:
+            st = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        st = {
+            "state": "open",
+            "focus": None,
+            "since": now_iso(),
+            "expires_at": None,
+            "bypass_kinds": BYPASS_KINDS,
+        }
+    # Auto-expire check on every load — seamless safety net.
+    if st.get("expires_at"):
+        exp = datetime.fromisoformat(st["expires_at"].replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= exp and st["state"] != "open":
+            st = {
+                "state": "open",
+                "focus": None,
+                "since": now_iso(),
+                "expires_at": None,
+                "bypass_kinds": BYPASS_KINDS,
+                "_auto_reopened_from": st.get("focus"),
+            }
+            save(st)
+    return st
+
+def save(st):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=2)
+    tmp.rename(STATE_PATH)
+
+def set_state(new_state, focus=None, duration_min=None):
+    duration_min = duration_min or DEFAULT_FOCUS_MIN
+    duration_min = min(duration_min, MAX_FOCUS_MIN)
+    st = {
+        "state": new_state,
+        "focus": focus,
+        "since": now_iso(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=duration_min)).strftime("%Y-%m-%dT%H:%M:%SZ") if new_state != "open" else None,
+        "bypass_kinds": BYPASS_KINDS,
+    }
+    save(st)
+    return st
+
+def is_urgent(content):
+    """Match Tejas's URGENT human-bypass marker.
+    Catches !URGENT!, URGENT!!, URGENT!!!!!, urgent!!! (case-insensitive),
+    and plain 'URGENT' as a standalone word.
+    """
+    if not content:
+        return False
+    import re
+    # Match standalone word URGENT (any case) — simple + permissive
+    # Catches: URGENT, Urgent, !URGENT!, URGENT!!!!, urgent, !urgent
+    return bool(re.search(r"\burgent\b", content, re.IGNORECASE))
+
+def dispatchable(st, kind, mention=False, content=None):
+    """Return True if an event of this kind+mention+content should dispatch."""
+    if st["state"] == "open":
+        return True
+    if kind in st.get("bypass_kinds", BYPASS_KINDS):
+        return True
+    if mention:
+        return True
+    if content and is_urgent(content):
+        return True
+    return False  # GATED and CLOSED both queue-only for non-bypass events
+
+def cmd_status(args):
+    st = load()
+    print(json.dumps(st, indent=2))
+
+def cmd_open(args):
+    st = set_state("open")
+    print(f"attention: OPEN")
+
+def cmd_gate(args):
+    st = set_state("gated", focus=args.focus, duration_min=args.for_min)
+    print(f"attention: GATED ({args.focus}) until {st['expires_at']}")
+
+def cmd_close(args):
+    st = set_state("closed", focus=args.focus, duration_min=args.for_min)
+    print(f"attention: CLOSED ({args.focus}) until {st['expires_at']}")
+
+def cmd_check(args):
+    st = load()
+    sys.exit(0 if st["state"] == "open" else 1)
+
+def cmd_dispatchable(args):
+    st = load()
+    sys.exit(0 if dispatchable(st, args.kind, args.mention, args.content) else 1)
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    sub.add_parser("open")
+    g = sub.add_parser("gate")
+    g.add_argument("--focus", default=None)
+    g.add_argument("--for", dest="for_min", type=int, default=DEFAULT_FOCUS_MIN)
+    c = sub.add_parser("close")
+    c.add_argument("--focus", default=None)
+    c.add_argument("--for", dest="for_min", type=int, default=DEFAULT_FOCUS_MIN)
+    sub.add_parser("check")
+    d = sub.add_parser("dispatchable")
+    d.add_argument("--kind", required=True)
+    d.add_argument("--mention", action="store_true")
+    d.add_argument("--content", default=None, help="Message body — URGENT marker auto-detects and bypasses gate.")
+    args = p.parse_args()
+    dispatch = {
+        "status": cmd_status,
+        "open": cmd_open,
+        "gate": cmd_gate,
+        "close": cmd_close,
+        "check": cmd_check,
+        "dispatchable": cmd_dispatchable,
+    }
+    dispatch[args.cmd](args)
+
+if __name__ == "__main__":
+    main()

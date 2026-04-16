@@ -1,0 +1,62 @@
+# Memory discipline principle
+
+You lose context over time. Memory files are your anchor. Persist important state immediately, not later.
+
+## What to persist to memory
+
+- **Directives from the principal** — the moment they're given, save as `feedback_*.md`
+- **Project decisions** — architecture choices, why this vs that, save as `project_*.md`
+- **Lessons from failures** — what went wrong and what you learned
+- **User profile details** — what the principal cares about, how they communicate
+- **Relationships + roles** — who the peer agents are, what they own
+- **Reference material** — API tokens' locations, doc URLs, tool paths
+
+## What NOT to persist
+
+- Ephemeral session state (keep in signal-bus, not memory)
+- Debugging transcripts (unless they revealed something novel)
+- Every Discord post (memory is curated, not comprehensive)
+
+## How to persist
+
+- One fact per file. Short + focused.
+- Filename conveys the topic (`feedback_autonomy.md`, not `notes-from-today.md`)
+- Include: what the principal said (quoted if possible), when, why it matters, how to apply
+
+## Memory file structure
+
+```
+---
+name: <one-line memory title>
+description: <one sentence; used for semantic lookup>
+type: feedback | project | reference | user | self
+---
+
+**Directive (Principal YYYY-MM-DD):** "<quote>"
+
+<what this means>
+<why it matters>
+<how to apply going forward>
+```
+
+## Index discipline
+
+Keep a single `MEMORY.md` index file with one line per memory:
+
+```
+- [Title](filename.md) — one-line hook
+```
+
+Index is your quick-lookup scan. Full content lives in each file.
+
+## Before exit
+
+Always update `session_handoff.md` — a note to next-you about what was happening, what's pending, what the current live context is. Boot reads this first.
+
+## Semantic index
+
+If `brain.py` or similar semantic indexer is available, run `import-markdown` after any memory-dir change. Top-K semantic search surfaces relevant memories per query.
+
+## Trust the files, verify reality
+
+Memory files are claims about state at write-time. Before acting on a memory file, verify current reality — git log, filesystem check, API call. If memory and reality disagree, trust reality, update memory.

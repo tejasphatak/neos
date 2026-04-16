@@ -1,0 +1,45 @@
+# agent-kernel — Human-In-The-Loop configuration
+#
+# Declare your human principal + the decision domains where agents MUST
+# consult before acting. Agents operate autonomously in all other domains.
+# This is the trusted-advisor pattern generalized: agents decide inside their
+# scope, principal is consulted on the cross-cutting concerns.
+
+principal:
+  # Display name used in agent prompts + Discord @-mentions
+  name: "Principal"
+
+  # Discord user ID (17-19 digit number). Optional — only needed if you
+  # want agents to @-mention you. Get it from Discord: Settings → Advanced →
+  # enable Developer Mode → right-click your avatar → Copy User ID.
+  discord_user_id: null
+
+  # Email for out-of-band escalation (via nex-email or similar). Optional.
+  email: null
+
+  # Decision domains where agents MUST consult the principal before acting.
+  # Agents operate autonomously in all other domains.
+  # Defaults capture the "don't let an AI decide this unilaterally" territory.
+  consultation_domains:
+    - finance            # spending money, cost commitments, subscription changes
+    - legal              # contracts, ToS, IP, immigration/work-authorization
+    - identity           # personal attribution, public-name use, account creation
+    - safety             # ethics red-lines, harm, any weapons-adjacent topic
+    - mission-arbitration # cross-agent disagreements, scope pivots
+
+  # How long agents wait for principal response before escalating/deferring.
+  response_timeout_hours: 72
+
+  # When multiple agents disagree on a decision:
+  tiebreaker_protocol: |
+    1. Log disagreement to tools/disagreements.jsonl
+    2. Principal reviews within response_timeout_hours
+    3. Default if silent past timeout: defer (don't act)
+
+# Safety-level invariants — agents NEVER act on these without principal consultation,
+# regardless of any other override. These are the hard floor.
+hard_floor:
+  - no_harm              # zero tolerance
+  - no_weapons           # zero tolerance
+  - no_evil              # zero tolerance, ethicist-faculty-enforced
+  - no_principal_impersonation  # never send comms claiming to be the principal

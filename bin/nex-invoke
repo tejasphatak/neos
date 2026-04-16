@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+nex-invoke — unified invocation router.
+
+Usage:
+  nex-invoke agent <name> "prompt"            # agent-to-agent via stream-json
+  nex-invoke faculty <name> "prompt"          # ephemeral faculty spawn
+  nex-invoke --list agents | faculties         # registry listing
+
+Dispatches to the right bin based on invocation kind. Both sub-invocations
+support --post, --mention-principal, --force, --backend overrides.
+"""
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+KERNEL = Path(__file__).resolve().parent.parent
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("kind", choices=["agent", "faculty"], nargs="?")
+    p.add_argument("name", nargs="?")
+    p.add_argument("prompt", nargs="?")
+    p.add_argument("--list", choices=["agents", "faculties"])
+    p.add_argument("--post", action="store_true")
+    p.add_argument("--mention-principal", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--backend")
+    args = p.parse_args()
+
+    if args.list == "agents":
+        reg = KERNEL / "config" / "agents.yaml"
+        if reg.exists():
+            print(reg.read_text())
+        else:
+            print("no agents.yaml registry yet — run nex-init to create one")
+        return
+
+    if args.list == "faculties":
+        for f in sorted((KERNEL / "templates" / "faculty").glob("*.md")):
+            print(f.stem)
+        return
+
+    if not args.kind or not args.name or not args.prompt:
+        p.error("usage: nex-invoke <agent|faculty> <name> \"prompt\"")
+
+    target_bin = KERNEL / "bin" / f"nex-invoke-{args.kind}"
+    if not target_bin.exists():
+        print(f"error: {target_bin} not found", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [str(target_bin)]
+    if args.post:
+        cmd.append("--post")
+    if args.mention_principal:
+        cmd.append("--mention-tejas")  # TODO: rename in underlying bin to --mention-principal
+    if args.force:
+        cmd.append("--force")
+    if args.kind == "agent":
+        env = {**os.environ, "NEX_AGENT_TARGET": args.name}
+        cmd.append(args.prompt)
+        r = subprocess.run(cmd, env=env)
+    else:
+        cmd.extend([args.name, args.prompt])
+        r = subprocess.run(cmd)
+    sys.exit(r.returncode)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# nex-init — bootstrap a new agent from templates.
+# Creates ~/.agent-kernel/agents/<name>/ with identity, principles, workspace, memory, session, inbox, outbox, state.
+# Generates systemd unit files + registers in agents.yaml.
+# Prompts for Discord bot token + webhook (optional).
+# Runs nex-fit-test before marking ready for boot.
+
+set -u
+
+KERNEL_ROOT="$HOME/agent-kernel"
+AGENT_ROOT="$HOME/.agent-kernel"
+CONFIG_DIR="$AGENT_ROOT/config"
+
+usage() {
+    cat <<EOF
+Usage: nex-init <agent-name> [--persona scholar|maker|custom]
+
+Creates a new agent scaffold at ~/.agent-kernel/agents/<agent-name>/
+
+Options:
+  --persona <name>   Identity persona template (default: custom interactive prompt)
+  --skip-fit-test    Don't run fit-test after init (NOT RECOMMENDED)
+  --backend <name>   Backend: claude-cli (default), anthropic-api, gemini (roadmap)
+EOF
+}
+
+AGENT_NAME=""
+PERSONA="custom"
+SKIP_FIT_TEST=0
+BACKEND="claude-cli"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --persona)       PERSONA="$2"; shift 2;;
+        --skip-fit-test) SKIP_FIT_TEST=1; shift;;
+        --backend)       BACKEND="$2"; shift 2;;
+        --help|-h)       usage; exit 0;;
+        -*)              echo "unknown option: $1" >&2; exit 1;;
+        *)
+            if [ -z "$AGENT_NAME" ]; then
+                AGENT_NAME="$1"
+            else
+                echo "extra argument: $1" >&2; exit 1
+            fi
+            shift;;
+    esac
+done
+
+[ -z "$AGENT_NAME" ] && { usage; exit 1; }
+
+# Validate agent name
+if ! [[ "$AGENT_NAME" =~ ^[a-z][a-z0-9-]*$ ]]; then
+    echo "error: agent name must match ^[a-z][a-z0-9-]*$" >&2
+    exit 1
+fi
+
+AGENT_DIR="$AGENT_ROOT/agents/$AGENT_NAME"
+if [ -d "$AGENT_DIR" ]; then
+    echo "error: agent '$AGENT_NAME' already exists at $AGENT_DIR" >&2
+    exit 1
+fi
+
+echo "Initializing agent '$AGENT_NAME' (persona: $PERSONA, backend: $BACKEND)"
+
+# Scaffolding
+mkdir -p "$AGENT_DIR"/{memory,workspace,session,inbox,outbox,state,hooks}
+
+# Copy/render identity template
+if [ -f "$KERNEL_ROOT/templates/personas/$PERSONA.yaml" ]; then
+    # Persona provides defaults; merge into identity template
+    echo "  (using persona defaults from templates/personas/$PERSONA.yaml)"
+fi
+
+# Interactive-or-defaulted binding values
+read -rp "  Domain (1-sentence: what does $AGENT_NAME own?) [generic]: " DOMAIN_INPUT
+DOMAIN="${DOMAIN_INPUT:-generic}"
+
+read -rp "  Host [cortex2-vm]: " HOST_INPUT
+HOST="${HOST_INPUT:-cortex2-vm}"
+
+read -rp "  Mission [access to AI for those without data centers]: " MISSION_INPUT
+MISSION="${MISSION_INPUT:-access to AI for those without data centers}"
+
+read -rp "  Principal name [Principal]: " PRINCIPAL_INPUT
+PRINCIPAL="${PRINCIPAL_INPUT:-Principal}"
+
+read -rp "  Think cadence seconds [120]: " CADENCE_INPUT
+CADENCE="${CADENCE_INPUT:-120}"
+
+read -rp "  Discord bot token (blank to skip): " DISCORD_BOT_TOKEN
+read -rp "  Discord webhook URL (blank to skip): " DISCORD_WEBHOOK
+
+# Render CLAUDE.md from template
+template_file="$KERNEL_ROOT/templates/identity/CLAUDE.md.template"
+if [ -f "$template_file" ]; then
+    sed \
+        -e "s|{{AGENT_NAME}}|$AGENT_NAME|g" \
+        -e "s|{{HOST}}|$HOST|g" \
+        -e "s|{{MISSION}}|$MISSION|g" \
+        -e "s|{{PRINCIPAL_NAME}}|$PRINCIPAL|g" \
+        -e "s|{{PRINCIPAL_CHANNEL}}|Discord|g" \
+        -e "s|{{AGENT_WORKSPACE}}|$AGENT_DIR|g" \
+        -e "s|{{CONSULTATION_DOMAINS}}|finance, legal, identity, safety, mission-arbitration|g" \
+        -e "s|{{OWNED_DOMAINS}}|- $DOMAIN|g" \
+        -e "s|{{PEER_DOMAINS}}|(see agents.yaml)|g" \
+        -e "s|{{VOICE_PRINCIPLES}}|(see templates/principles/voice.md.template)|g" \
+        -e "s|{{THINK_CADENCE_SEC}}|$CADENCE|g" \
+        -e "s|{{THINK_ASPECTS}}|pattern, safety, advisor, self-check, pattern-recognition|g" \
+        -e "s|{{RESPONSE_TIMEOUT_HOURS}}|72|g" \
+        -e "s|{{PERSONA}}|$PERSONA|g" \
+        "$template_file" > "$AGENT_DIR/CLAUDE.md"
+    echo "  ✓ identity scaffolded: $AGENT_DIR/CLAUDE.md"
+else
+    echo "error: template not found at $template_file" >&2
+    exit 1
+fi
+
+# Initialize memory with MEMORY.md + session_handoff.md stub
+cat > "$AGENT_DIR/memory/MEMORY.md" <<EOF
+- [session_handoff](session_handoff.md) — live conversation state
+EOF
+
+cat > "$AGENT_DIR/memory/session_handoff.md" <<EOF
+# Session Handoff — $AGENT_NAME
+
+(Fresh agent. Read CLAUDE.md for identity + principles. See templates/principles/ for the full principle set.)
+
+## What happened last
+
+Agent initialized $(date -Is) via nex-init.
+
+## What's next
+
+First fit-test + first consultation with principal to confirm mission alignment.
+EOF
+echo "  ✓ memory scaffolded: $AGENT_DIR/memory/"
+
+# Settings.json (minimal — hooks wired to agent-scoped signal bus)
+cat > "$AGENT_DIR/settings.json" <<EOF
+{
+  "permissions": {
+    "allow": ["Bash", "Edit", "Write", "Read", "Glob", "Grep", "Agent", "WebFetch", "WebSearch"]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {"type": "command", "command": "$AGENT_DIR/hooks/signal-bus-inbox.sh", "timeout": 3}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+# Hook script (per-agent)
+cat > "$AGENT_DIR/hooks/signal-bus-inbox.sh" <<'HOOKEOF'
+#!/usr/bin/env bash
+# Auto-generated by nex-init. Reads agent's inbox + signal-bus, surfaces at turn start.
+# Customize as needed.
+set -u
+AGENT_DIR="$(dirname "$(dirname "$0")")"
+INBOX="$AGENT_DIR/inbox"
+STATE="$AGENT_DIR/state"
+mkdir -p "$STATE"
+
+if [[ -d "$INBOX" ]]; then
+    new_files=$(find "$INBOX" -type f -newer "$STATE/inbox-watermark" 2>/dev/null | head -10)
+    if [[ -z "$new_files" ]] && [[ ! -f "$STATE/inbox-watermark" ]]; then
+        new_files=$(ls -t "$INBOX"/* 2>/dev/null | head -5)
+    fi
+    if [[ -n "$new_files" ]]; then
+        echo "Agent inbox:"
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && echo "  - $(basename "$f")"
+        done <<< "$new_files"
+    fi
+    touch "$STATE/inbox-watermark"
+fi
+exit 0
+HOOKEOF
+chmod +x "$AGENT_DIR/hooks/signal-bus-inbox.sh"
+
+# fit-test-bindings.yaml for placeholder substitution during fit-test
+cat > "$AGENT_DIR/fit-test-bindings.yaml" <<EOF
+AGENT_NAME: $AGENT_NAME
+PRINCIPAL_NAME: $PRINCIPAL
+DOMAIN: $DOMAIN
+HOST: $HOST
+MISSION: $MISSION
+EOF
+
+# Agents.yaml registry update
+mkdir -p "$CONFIG_DIR"
+AGENTS_YAML="$CONFIG_DIR/agents.yaml"
+if [ ! -f "$AGENTS_YAML" ]; then
+    cat > "$AGENTS_YAML" <<'REGYAML'
+# agent-kernel agent registry — auto-managed by nex-init. Edit carefully.
+agents:
+REGYAML
+fi
+
+cat >> "$AGENTS_YAML" <<EOF
+  - name: $AGENT_NAME
+    backend: $BACKEND
+    identity: $AGENT_DIR/CLAUDE.md
+    workspace: $AGENT_DIR/workspace
+    memory: $AGENT_DIR/memory
+    discord_bot_token: ${DISCORD_BOT_TOKEN:-null}
+    discord_webhook: ${DISCORD_WEBHOOK:-null}
+    think:
+      cadence_sec: $CADENCE
+      aspects: [pattern, safety, advisor, self-check, pattern-recognition]
+    consultation_domains: [finance, legal, identity, safety, mission-arbitration]
+EOF
+
+echo "  ✓ registered in agents.yaml"
+
+# Run fit-test
+if [ "$SKIP_FIT_TEST" = "0" ]; then
+    echo
+    echo "Running nex-fit-test against $AGENT_NAME..."
+    "$KERNEL_ROOT/bin/nex-fit-test" "$AGENT_NAME" || {
+        echo
+        echo "fit-test failed — agent will not boot until fit-test passes."
+        echo "  review: ~/.agent-kernel/fit-test-logs/"
+        echo "  amend:  $AGENT_DIR/CLAUDE.md  OR  templates/principles/*"
+        echo "  retry:  nex-fit-test $AGENT_NAME"
+        exit 2
+    }
+    echo "  ✓ fit-test passed"
+fi
+
+echo
+echo "Agent '$AGENT_NAME' initialized at $AGENT_DIR"
+echo
+echo "Next steps:"
+echo "  1. Review + personalize:  \$EDITOR $AGENT_DIR/CLAUDE.md"
+echo "  2. Enable continuous cognition:  systemctl --user enable --now agent-think@$AGENT_NAME"
+if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
+    echo "  3. Enable Discord listener:     systemctl --user enable --now agent-bot@$AGENT_NAME"
+fi
+echo "  4. First invocation test:  nex-invoke agent $AGENT_NAME 'say hi'"
+echo

@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent-kernel Discord bot for %i
+After=default.target
+
+[Service]
+Type=simple
+Environment=AGENT_NAME=%i
+ExecStart=/usr/bin/python3 %h/agent-kernel/bin/agent-bot.py --agent %i
+Restart=on-failure
+RestartSec=10s
+StandardOutput=append:%h/.agent-kernel/logs/%i-bot.log
+StandardError=append:%h/.agent-kernel/logs/%i-bot.log
+
+[Install]
+WantedBy=default.target

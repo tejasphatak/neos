@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# nex-state-snapshot — rsync VM body state into ~/nexus-state/ for git-backup.
+# Private repo only. Secrets categorically excluded. Runs idempotently.
+set -u
+
+SRC="$HOME"
+DST="$HOME/nexus-state"
+LOG="$DST/.last-snapshot.log"
+
+mkdir -p "$DST"
+
+RSYNC_COMMON=(
+    --archive
+    --delete
+    --quiet
+    --exclude=".git/"
+    --exclude="node_modules/"
+    --exclude="__pycache__/"
+    --exclude="*.pyc"
+    --exclude=".venv/"
+    --exclude="venv/"
+    --exclude=".cache/"
+    --exclude="*.log"
+    --exclude="*.pid"
+    --exclude="*.sock"
+    # Secret files — primary defense (defense-in-depth with .gitignore)
+    --exclude="*.key"
+    --exclude="*.pem"
+    --exclude="*.p12"
+    --exclude="*.jks"
+    --exclude="*.keystore"
+    --exclude="*-key.json"
+    --exclude="*_key.json"
+    --exclude="fcm-key.json"
+    --exclude="credentials.json"
+    --exclude=".env"
+    --exclude=".env.*"
+    --exclude="secrets/"
+    --exclude=".admin_token"
+    --exclude=".push_tokens.json"
+    --exclude=".cloudflare_token"
+    --exclude=".credentials.json"
+)
+
+# 1. Home-top-level scripts + config files (not the whole home)
+mkdir -p "$DST/home"
+for f in CLAUDE.md discord-bot.py atlas-bot.py claude-resilient; do
+    [[ -f "$SRC/$f" ]] && cp -a "$SRC/$f" "$DST/home/$f"
+done
+
+# 2. Nexus scripts + bin + faculties + hooks + state (sans ephemeral logs)
+rsync "${RSYNC_COMMON[@]}" "$SRC/nexus/" "$DST/nexus/" 2>/dev/null || true
+rsync "${RSYNC_COMMON[@]}" \
+    --exclude="signals/*.jsonl" \
+    --exclude="wake-events/" \
+    --exclude="outputs/" \
+    --exclude="worker-session.jsonl" \
+    --exclude="task-queue.jsonl" \
+    --exclude="master.log" \
+    --exclude="state/*.json" \
+    "$SRC/.nexus/" "$DST/dotnexus/" 2>/dev/null || true
+
+# 3. Cortex2 — API + scripts + config, not runtime state
+rsync "${RSYNC_COMMON[@]}" \
+    --exclude="inbox/*.json" \
+    --exclude="inbox/*.md" \
+    --exclude="logs/" \
+    --exclude="sfca_ledger.db" \
+    --exclude="beat_*.txt" \
+    --exclude="queue*.json" \
+    --exclude="state.json" \
+    "$SRC/cortex2/" "$DST/cortex2/" 2>/dev/null || true
+
+# 4. Claude Code config + hooks + memory (SANS secrets, sans caches, sans large session files)
+mkdir -p "$DST/claude-config"
+[[ -f "$SRC/.claude/settings.json" ]] && cp -a "$SRC/.claude/settings.json" "$DST/claude-config/"
+[[ -d "$SRC/.claude/hooks" ]] && rsync "${RSYNC_COMMON[@]}" "$SRC/.claude/hooks/" "$DST/claude-config/hooks/"
+[[ -d "$SRC/.claude/memory-engine" ]] && rsync "${RSYNC_COMMON[@]}" \
+    --exclude="*.db" \
+    --exclude="__pycache__/" \
+    "$SRC/.claude/memory-engine/" "$DST/claude-config/memory-engine/"
+
+# Memory dir — markdown only. Session JSONLs are conversation transcripts,
+# keep out of git backup for now (re-derivable from session files that live
+# in the session JSONL dir; Tejas can toggle later).
+mkdir -p "$DST/claude-config/projects/-home-tejasphatak/memory"
+rsync "${RSYNC_COMMON[@]}" \
+    "$SRC/.claude/projects/-home-tejasphatak/memory/" \
+    "$DST/claude-config/projects/-home-tejasphatak/memory/" 2>/dev/null || true
+
+# Explicitly NEVER copy the secrets dir
+# (defense in depth: .gitignore also excludes it)
+
+# 5. Systemd user units (scripts depend on these for restart)
+mkdir -p "$DST/systemd-user"
+if [[ -d "$SRC/.config/systemd/user" ]]; then
+    rsync "${RSYNC_COMMON[@]}" "$SRC/.config/systemd/user/" "$DST/systemd-user/"
+fi
+
+# 6. Crontab snapshot
+crontab -l 2>/dev/null > "$DST/crontab.txt" || true
+
+# 7. Installed packages (for rebuild on new VM)
+dpkg --get-selections > "$DST/apt-packages.txt" 2>/dev/null || true
+pip list --format=freeze 2>/dev/null > "$DST/pip-packages.txt" || true
+
+# 8. Systemd --user list of active units
+systemctl --user list-units --type=service --no-legend > "$DST/systemd-units-active.txt" 2>/dev/null || true
+
+# 9. GCP instance metadata (for restore context)
+if command -v gcloud >/dev/null 2>&1; then
+    gcloud compute instances list 2>/dev/null > "$DST/gcp-instances.txt" || true
+fi
+
+# 10. Atlas thread (now local on cortex2-vm since triadic-sim shutdown 2026-04-16T19:00Z)
+# Rsync from ~/.agent-kernel/threads/<agent>/ — inbox/outbox/state excluded (ephemeral).
+ATLAS_DST="$DST/atlas"
+mkdir -p "$ATLAS_DST"
+rsync "${RSYNC_COMMON[@]}" \
+    --exclude="inbox/" \
+    --exclude="outbox/" \
+    --exclude="state/" \
+    --exclude="session/" \
+    "$HOME/.nexus/threads/atlas/" "$ATLAS_DST/" 2>/dev/null || true
+
+echo "snapshot complete at $(date -Is)" > "$LOG"
+echo "$DST populated"

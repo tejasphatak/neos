@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+nex-signal-post — event emitter for the webmind-dev coordination channel.
+
+Reads config from ~/.claude/secrets/discord.json (never hardcoded).
+Posts one event to Discord + appends to ~/.agent-kernel/signals/coord.jsonl.
+
+Usage:
+  nex-signal-post --agent nexus --kind commit --msg "2f4767c docs-scrub"
+  nex-signal-post --agent nexus --kind drop_sent --msg "handover-reply (4.7KB)" --peer atlas
+  nex-signal-post --agent nexus --kind drop_recv --msg "handover-proposal (3KB)" --peer atlas
+  nex-signal-post --agent nexus --kind gate --msg "paper-1 §3.5 [projection]"
+  nex-signal-post --agent nexus --kind alert --msg "A4 reply pending" --mention-tejas
+
+Agent identity (nexus|atlas), event kind, and message are required.
+--peer specifies the other agent for drop events.
+--mention-tejas adds an @mention (only when human action required).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+SECRETS_PATH = HOME / ".claude" / "secrets" / "discord.json"
+SIGNAL_BUS = HOME / ".nexus" / "signals" / "coord.jsonl"
+RATE_STATE = HOME / ".nexus" / "state" / "post-rate.json"
+
+# Rate limit: max 30 posts per 5-minute window (protects against runaway watchers)
+RATE_WINDOW_S = 300
+RATE_MAX_POSTS = 30
+
+# Dedup: suppress near-identical (agent+kind+first-N-chars) posts within window
+DEDUP_WINDOW_S = 1800   # 30 minutes
+DEDUP_PREFIX_CHARS = 80
+
+# Quiet hours: no non-urgent posts
+QUIET_START_HOUR = 1
+QUIET_END_HOUR = 7
+
+# No emojis per directive 2026-04-16. Keep the dict for future toggle but unused.
+EMOJI = {k: "" for k in ("commit","drop_sent","drop_recv","gate","alert","status","boot","rename")}
+
+
+def load_secrets():
+    with open(SECRETS_PATH) as f:
+        return json.load(f)
+
+
+def check_rate_limit():
+    """Return True if under rate limit, False if over."""
+    RATE_STATE.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    try:
+        with open(RATE_STATE) as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {"posts": []}
+    state["posts"] = [ts for ts in state.get("posts", []) if now - ts < RATE_WINDOW_S]
+    if len(state["posts"]) >= RATE_MAX_POSTS:
+        return False
+    state["posts"].append(now)
+    with open(RATE_STATE, "w") as f:
+        json.dump(state, f)
+    return True
+
+
+def is_duplicate(agent, kind, msg):
+    """Check if (agent, kind, msg-prefix) matches a recent post in the window.
+    Reads the signal-bus and looks back DEDUP_WINDOW_S seconds.
+    Returns True if a near-identical post was made recently."""
+    if not SIGNAL_BUS.exists():
+        return False
+    prefix = (msg or "")[:DEDUP_PREFIX_CHARS].lower().strip()
+    if not prefix:
+        return False
+    cutoff_ts = time.time() - DEDUP_WINDOW_S
+    try:
+        with open(SIGNAL_BUS) as f:
+            # Read tail efficiently — last ~200 entries is plenty for 30min window
+            lines = f.readlines()[-300:]
+    except Exception:
+        return False
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        # Parse timestamp
+        entry_ts_str = entry.get("ts", "")
+        try:
+            entry_ts = time.mktime(time.strptime(entry_ts_str, "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            continue
+        if entry_ts < cutoff_ts:
+            break  # older entries won't match (reverse chrono)
+        if entry.get("agent") != agent:
+            continue
+        if entry.get("kind") != kind:
+            continue
+        entry_msg = (entry.get("msg") or "")[:DEDUP_PREFIX_CHARS].lower().strip()
+        if entry_msg == prefix:
+            return True
+    return False
+
+
+def in_quiet_hours():
+    h = time.gmtime().tm_hour
+    if QUIET_START_HOUR <= QUIET_END_HOUR:
+        return QUIET_START_HOUR <= h < QUIET_END_HOUR
+    return h >= QUIET_START_HOUR or h < QUIET_END_HOUR
+
+
+def format_line(agent, kind, msg, peer=None, ts=None, mention_tejas=False, tejas_id=None):
+    # Webhook username already shows the sender — no redundant agent prefix.
+    # No emojis, no bracketed timestamp (Discord native).
+    peer_display = peer.capitalize() if peer else ""
+    if kind == "drop_sent" and peer:
+        body = f"sent drop to {peer_display}: {msg}"
+    elif kind == "drop_recv" and peer:
+        body = f"got drop from {peer_display}: {msg}"
+    elif kind == "commit":
+        body = f"committed: {msg}"
+    elif kind == "gate":
+        body = f"gate: {msg}"
+    elif kind == "boot":
+        body = f"online — {msg}"
+    elif kind == "rename":
+        body = f"renamed: {msg}"
+    else:
+        body = msg
+    if mention_tejas and tejas_id:
+        body = f"<@{tejas_id}> {body}"
+    return body
+
+
+def post_via_webhook(webhook_id, webhook_token, content):
+    """Post as the agent-identified webhook — no bot-user, distinct per-agent sender."""
+    url = f"https://discord.com/api/v10/webhooks/{webhook_id}/{webhook_token}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"content": content}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "nex-signal-post (webmind-coord)",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status, resp.read().decode()
+
+
+def append_signal_bus(agent, kind, msg, peer=None):
+    SIGNAL_BUS.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "agent": agent,
+        "kind": kind,
+        "msg": msg,
+    }
+    if peer:
+        entry["peer"] = peer
+    with open(SIGNAL_BUS, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--agent", required=True, choices=["nexus", "atlas"])
+    p.add_argument("--kind", required=True,
+                   choices=["commit", "drop_sent", "drop_recv", "gate",
+                            "alert", "status", "boot", "rename"])
+    p.add_argument("--msg", required=True)
+    p.add_argument("--peer", choices=["nexus", "atlas"])
+    p.add_argument("--mention-tejas", action="store_true")
+    p.add_argument("--urgent", action="store_true",
+                   help="Bypass quiet hours (use sparingly).")
+    args = p.parse_args()
+
+    urgent = args.urgent or args.kind == "alert"
+    if in_quiet_hours() and not urgent:
+        append_signal_bus(args.agent, args.kind, args.msg, args.peer)
+        print("quiet hours — appended to signal-bus, no Discord post", file=sys.stderr)
+        return 0
+
+    if not check_rate_limit():
+        append_signal_bus(args.agent, args.kind, args.msg, args.peer)
+        print("rate limit — appended to signal-bus, no Discord post", file=sys.stderr)
+        return 0
+
+    # Dedup check — suppress near-identical (agent+kind+prefix) posts within window.
+    # URGENT posts bypass dedup (real alerts need to surface even if similar).
+    if not urgent and is_duplicate(args.agent, args.kind, args.msg):
+        append_signal_bus(args.agent, args.kind, args.msg, args.peer)
+        print(f"dedup suppressed — matched {args.agent}/{args.kind} within {DEDUP_WINDOW_S}s", file=sys.stderr)
+        return 0
+
+    secrets = load_secrets()
+    tejas_id = secrets.get("tejas_user_id")
+
+    if args.mention_tejas and not tejas_id:
+        print("warning: mention-tejas requested but tejas_user_id not in secrets yet",
+              file=sys.stderr)
+
+    wh_id = secrets.get(f"webhook_{args.agent}_id")
+    wh_token = secrets.get(f"webhook_{args.agent}_token")
+    if not wh_id or not wh_token:
+        print(f"error: no webhook configured for agent={args.agent}", file=sys.stderr)
+        return 2
+
+    line = format_line(args.agent, args.kind, args.msg,
+                       peer=args.peer, mention_tejas=args.mention_tejas,
+                       tejas_id=tejas_id)
+    status, body = post_via_webhook(wh_id, wh_token, line)
+    append_signal_bus(args.agent, args.kind, args.msg, args.peer)
+    if status >= 300:
+        print(f"post failed: {status} {body}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

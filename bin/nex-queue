@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+nex-queue — shared-queue CLI for Nexus + Atlas coordination.
+
+File: $QUEUE_PATH (default webmind-research/shared-queue/tasks.jsonl)
+Format: append-only JSONL. Each line is a task or an update event.
+Schema for a task:
+  {"id":"sq-XXXX","kind":"task","created_by":"nexus|atlas|tejas",
+   "created_at":"<iso>","title":"...","status":"open",
+   "assigned_to":null,"priority":"low|normal|high|urgent",
+   "deps":[],"blocked_on":null,"tags":[],"notes":""}
+Schema for an update:
+  {"id":"sq-XXXX","kind":"update","by":"nexus|atlas|tejas",
+   "at":"<iso>","event":"claim|start|block|unblock|complete|cancel|note",
+   "detail":"..."}
+
+Commands:
+  nex-queue list [--status STATUS] [--tag TAG] [--assigned AGENT] [--mine]
+  nex-queue add --title "..." [--priority P] [--tags t1,t2] [--deps id1,id2] [--notes "..."]
+  nex-queue claim <id>            # write update event; set assigned_to=nexus
+  nex-queue start <id>            # status=wip
+  nex-queue block <id> --reason "..."
+  nex-queue unblock <id>
+  nex-queue done <id> [--notes "..."]
+  nex-queue cancel <id> --reason "..."
+  nex-queue note <id> "note text"
+  nex-queue show <id>             # print task + all updates
+
+Resolution of a task's current state reads all lines, folds updates.
+No mutation to existing lines — always append.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import subprocess
+from pathlib import Path
+from datetime import datetime, timezone
+
+HOME = Path.home()
+DEFAULT_QUEUE = HOME / "webmind-research" / "shared-queue" / "tasks.jsonl"
+QUEUE_PATH = Path(os.environ.get("NEX_QUEUE_PATH", str(DEFAULT_QUEUE)))
+AGENT = os.environ.get("NEX_AGENT", "nexus")
+REPO_DIR = QUEUE_PATH.parent.parent  # webmind-research
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_all():
+    if not QUEUE_PATH.exists():
+        return []
+    entries = []
+    with open(QUEUE_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    return entries
+
+
+def resolve_tasks(entries):
+    """Fold updates onto tasks. Return {id: task_state}."""
+    tasks = {}
+    for e in entries:
+        if e.get("kind") == "task":
+            tasks[e["id"]] = {**e, "updates": []}
+    for e in entries:
+        if e.get("kind") == "update":
+            tid = e.get("id")
+            if tid not in tasks:
+                continue
+            t = tasks[tid]
+            t["updates"].append(e)
+            ev = e.get("event")
+            if ev == "claim":
+                t["assigned_to"] = e.get("by")
+                t["status"] = "claimed"
+            elif ev == "start":
+                t["status"] = "wip"
+            elif ev == "block":
+                t["status"] = "blocked"
+                t["blocked_on"] = e.get("detail")
+            elif ev == "unblock":
+                t["status"] = "wip"
+                t["blocked_on"] = None
+            elif ev == "complete":
+                t["status"] = "done"
+            elif ev == "cancel":
+                t["status"] = "cancelled"
+    return tasks
+
+
+def next_id(entries):
+    existing = [int(e["id"].split("-")[1]) for e in entries if e.get("kind") == "task" and e.get("id", "").startswith("sq-")]
+    n = max(existing, default=0) + 1
+    return f"sq-{n:04d}"
+
+
+def append(entry):
+    QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(QUEUE_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def git_commit_and_push(subject):
+    """Best-effort git commit + push. Non-fatal on failure."""
+    try:
+        subprocess.run(["git", "-C", str(REPO_DIR), "add", str(QUEUE_PATH.relative_to(REPO_DIR))],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(REPO_DIR), "commit", "-m", subject,
+                        "--author", f"{AGENT.capitalize()} (webmind-research) <ai-coauthor+{AGENT}@webmind.sh>"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(REPO_DIR), "push"],
+                       check=True, capture_output=True, timeout=20)
+        return True
+    except Exception as e:
+        print(f"[nex-queue] git push failed ({e!r}); local append succeeded", file=sys.stderr)
+        return False
+
+
+def emit_discord(kind_event, task_id, title):
+    """Fire-and-forget: post a one-line event to Discord via nex-signal-post."""
+    poster = HOME / "nexus" / "bin" / "nex-signal-post"
+    if not poster.exists():
+        return
+    msg = f"queue {kind_event} {task_id}: {title[:100]}"
+    try:
+        subprocess.Popen(
+            [str(poster), "--agent", AGENT, "--kind", "status", "--msg", msg],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def cmd_list(args):
+    entries = load_all()
+    tasks = resolve_tasks(entries)
+    items = sorted(tasks.values(), key=lambda t: (
+        {"urgent": 0, "high": 1, "normal": 2, "low": 3}.get(t.get("priority", "normal"), 2),
+        t.get("created_at", ""),
+    ))
+    for t in items:
+        if args.status and t.get("status") != args.status:
+            continue
+        if args.tag and args.tag not in t.get("tags", []):
+            continue
+        if args.assigned and t.get("assigned_to") != args.assigned:
+            continue
+        if args.mine and t.get("assigned_to") != AGENT:
+            continue
+        blocked = f" (blocked: {t['blocked_on']})" if t.get("blocked_on") else ""
+        asg = f" @{t['assigned_to']}" if t.get("assigned_to") else ""
+        tags = " [" + ",".join(t.get("tags", [])) + "]" if t.get("tags") else ""
+        print(f"{t['id']} [{t['priority']:<6}] {t['status']:<10}{asg}{blocked}  {t['title']}{tags}")
+
+
+def cmd_add(args):
+    entries = load_all()
+    tid = next_id(entries)
+    task = {
+        "id": tid, "kind": "task", "created_by": AGENT,
+        "created_at": now_iso(), "title": args.title, "status": "open",
+        "assigned_to": None, "priority": args.priority or "normal",
+        "deps": (args.deps.split(",") if args.deps else []),
+        "blocked_on": None,
+        "tags": (args.tags.split(",") if args.tags else []),
+        "notes": args.notes or "",
+    }
+    append(task)
+    print(f"created {tid}: {args.title}")
+    if not args.no_push:
+        git_commit_and_push(f"queue: add {tid} — {args.title[:60]}")
+    if not args.no_notify:
+        emit_discord("added", tid, args.title)
+
+
+def _update(tid, event, detail=""):
+    entries = load_all()
+    tasks = resolve_tasks(entries)
+    if tid not in tasks:
+        print(f"task {tid} not found", file=sys.stderr)
+        sys.exit(1)
+    upd = {"id": tid, "kind": "update", "by": AGENT, "at": now_iso(),
+           "event": event, "detail": detail}
+    append(upd)
+    title = tasks[tid]["title"]
+    return title
+
+
+def cmd_claim(args):
+    title = _update(args.id, "claim")
+    print(f"claimed {args.id}")
+    git_commit_and_push(f"queue: claim {args.id}")
+    emit_discord("claimed", args.id, title)
+
+
+def cmd_start(args):
+    title = _update(args.id, "start")
+    print(f"started {args.id}")
+    git_commit_and_push(f"queue: start {args.id}")
+    emit_discord("started", args.id, title)
+
+
+def cmd_block(args):
+    title = _update(args.id, "block", args.reason)
+    print(f"blocked {args.id}: {args.reason}")
+    git_commit_and_push(f"queue: block {args.id}")
+    emit_discord("blocked", args.id, f"{title} — {args.reason[:60]}")
+
+
+def cmd_unblock(args):
+    title = _update(args.id, "unblock")
+    print(f"unblocked {args.id}")
+    git_commit_and_push(f"queue: unblock {args.id}")
+    emit_discord("unblocked", args.id, title)
+
+
+def cmd_done(args):
+    title = _update(args.id, "complete", args.notes or "")
+    print(f"completed {args.id}")
+    git_commit_and_push(f"queue: done {args.id}")
+    emit_discord("done", args.id, title)
+
+
+def cmd_cancel(args):
+    title = _update(args.id, "cancel", args.reason)
+    print(f"cancelled {args.id}: {args.reason}")
+    git_commit_and_push(f"queue: cancel {args.id}")
+    emit_discord("cancelled", args.id, title)
+
+
+def cmd_note(args):
+    title = _update(args.id, "note", args.note)
+    print(f"noted {args.id}")
+    git_commit_and_push(f"queue: note {args.id}")
+
+
+def cmd_show(args):
+    entries = load_all()
+    tasks = resolve_tasks(entries)
+    t = tasks.get(args.id)
+    if not t:
+        print(f"task {args.id} not found", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(t, indent=2))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    l = sub.add_parser("list")
+    l.add_argument("--status")
+    l.add_argument("--tag")
+    l.add_argument("--assigned")
+    l.add_argument("--mine", action="store_true")
+
+    a = sub.add_parser("add")
+    a.add_argument("--title", required=True)
+    a.add_argument("--priority", choices=["low", "normal", "high", "urgent"])
+    a.add_argument("--tags", help="comma-separated")
+    a.add_argument("--deps", help="comma-separated task IDs")
+    a.add_argument("--notes")
+    a.add_argument("--no-push", action="store_true", help="skip git push")
+    a.add_argument("--no-notify", action="store_true", help="skip Discord")
+
+    for name in ("claim", "start", "unblock", "done"):
+        c = sub.add_parser(name)
+        c.add_argument("id")
+        if name == "done":
+            c.add_argument("--notes")
+
+    b = sub.add_parser("block")
+    b.add_argument("id")
+    b.add_argument("--reason", required=True)
+
+    cc = sub.add_parser("cancel")
+    cc.add_argument("id")
+    cc.add_argument("--reason", required=True)
+
+    n = sub.add_parser("note")
+    n.add_argument("id")
+    n.add_argument("note")
+
+    s = sub.add_parser("show")
+    s.add_argument("id")
+
+    args = p.parse_args()
+    dispatch = {
+        "list": cmd_list, "add": cmd_add, "claim": cmd_claim, "start": cmd_start,
+        "block": cmd_block, "unblock": cmd_unblock, "done": cmd_done,
+        "cancel": cmd_cancel, "note": cmd_note, "show": cmd_show,
+    }
+    dispatch[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

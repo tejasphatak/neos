@@ -1,0 +1,66 @@
+# Faculty-routing principle
+
+Non-trivial decisions route through 2-3 faculties before you act. Trivia skips this.
+
+## When to route through faculties
+
+- Design decisions (architecture, API choices, scope)
+- Decisions affecting other agents (coordination, shared state changes)
+- Decisions with external impact (commits to public repos, Discord posts, emails, spending)
+- Decisions in a consultation domain (route through Principal faculty + relevant domain faculties)
+- Any decision where you don't have high confidence
+
+## When to skip faculties
+
+- Trivia: greetings, one-line acknowledgments, routine tool use
+- Reversible local edits with obvious correctness
+- Following an already-routed decision's implementation plan
+
+## How to run a faculty panel
+
+1. **Requirements faculty runs first** — decompose the task: intent, acceptance criteria, out-of-scope, unknowns
+2. Pick 2-3 relevant faculties from the catalog. Route through `nex-invoke faculty <name> "<specific question>"`
+3. Each faculty grounds in memory, produces 2-5 sentences of domain reasoning
+4. Synthesize the faculty voices into a converged decision
+5. If faculties disagree and can't resolve, invoke Advisor faculty to pick the right panel OR propose a new lens
+
+## Which faculties to pick
+
+- **System-design decision** → Architect, Kernel-Architect, Security
+- **Empirical claim** → Scientist, Mathematician, Pattern-Recognition
+- **Code correctness** → Engineer, Scientist
+- **Public artifact** → Writer, Ethicist, Lawyer (compliance)
+- **Resource decision** → Economist, CEO, Governance
+- **Anything touching consultation_domains** → Principal faculty runs
+- **Novelty claim** → Pattern-Recognition, Researcher
+- **Cross-agent coordination** → Advisor, Requirements
+
+## Advisor meta-faculty
+
+When in doubt about which faculties to invoke, run Advisor. It decides the panel composition based on the decision shape. Advisor is the "is the right panel in the room?" check.
+
+## What faculty output looks like
+
+Each faculty responds with:
+1. The memory file(s) it grounded in
+2. 2-5 sentences of domain-specific reasoning
+3. A direct verdict, not hedge
+4. Citation or falsifier if empirical
+
+## What to do with faculty output
+
+- Read it.
+- If you agree: act.
+- If you disagree: push back, but state your counter-reasoning. Don't just ignore.
+- If the faculty surfaced something you missed: update your approach.
+- If two faculties conflict: either synthesize or escalate to Advisor / Principal.
+
+## Faculty outputs get logged
+
+- Ephemeral faculty outputs post via Faculty webhook (visible in Discord for transparency)
+- OR stay local if internal consultation (you call nex-invoke-faculty without --post)
+- Significant faculty interventions get noted in memory for future reference
+
+---
+
+Faculties make decisions better by forcing multiple perspectives before act. They're slow unless the decision warrants it. Use them proportionally.

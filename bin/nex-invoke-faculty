@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+nex-invoke-faculty — spawn an ephemeral faculty thread, capture response, post to Discord.
+
+Usage:
+  nex-invoke-faculty <name> <prompt>          # spawn, return stdout to caller
+  nex-invoke-faculty --post <name> <prompt>   # also post to Discord as <Name>
+  nex-invoke-faculty --list                   # list available faculties
+
+Each faculty runs:
+  - cwd=/tmp/faculty-<name>-<uuid>/ (ephemeral, no CLAUDE.md ancestor discovery)
+  - claude -p --append-system-prompt-file ~/.agent-kernel/faculties/<name>.md
+  - --no-session-persistence (no disk session)
+  - --permission-mode default (read-only by default; no bypassPermissions)
+  - --allowed-tools Read,Grep,Glob  (faculties can read memory for grounding; no writes/bash by default)
+
+Faculty identity files live at ~/.agent-kernel/faculties/<name>.md. Schema:
+  # <Faculty Name>
+  ## Mandate
+  <what this lens does, 1-3 sentences>
+  ## Grounding memory
+  <list of memory files this faculty must read>
+  ## Voice
+  <how this faculty speaks — concise, evidence-cited, etc.>
+  ## Output expectations
+  <structured output format if needed>
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+FACULTIES_DIR = HOME / ".nexus" / "faculties"
+SECRETS = HOME / ".claude" / "secrets" / "discord.json"
+TIMEOUT_SEC = int(os.environ.get("NEX_FACULTY_TIMEOUT", "90"))
+MODEL = os.environ.get("NEX_FACULTY_MODEL", "sonnet")
+
+
+def load_secrets():
+    with open(SECRETS) as f:
+        return json.load(f)
+
+
+def list_faculties():
+    if not FACULTIES_DIR.exists():
+        return []
+    return sorted([p.stem for p in FACULTIES_DIR.glob("*.md")])
+
+
+def faculty_path(name):
+    p = FACULTIES_DIR / f"{name}.md"
+    if not p.exists():
+        print(f"error: no faculty file at {p}", file=sys.stderr)
+        print(f"available: {', '.join(list_faculties())}", file=sys.stderr)
+        sys.exit(2)
+    return p
+
+
+def invoke(name, prompt_text):
+    """Run claude -p with faculty identity scaffolding, capture stdout.
+    Prompt via stdin to avoid --allowed-tools greedy-consume collision."""
+    fp = faculty_path(name)
+    workspace = Path(tempfile.mkdtemp(prefix=f"faculty-{name}-"))
+    try:
+        cmd = [
+            "claude", "-p",
+            "--model", MODEL,
+            "--append-system-prompt-file", str(fp),
+            "--no-session-persistence",
+            "--permission-mode", "default",
+            "--allowed-tools", "Read", "Grep", "Glob",
+        ]
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workspace),
+            input=prompt_text,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SEC,
+        )
+        output = proc.stdout.strip()
+        if proc.returncode != 0:
+            output += f"\n[faculty {name} exited {proc.returncode}: {proc.stderr[:400]}]"
+        return output
+    finally:
+        import shutil
+        try:
+            shutil.rmtree(workspace, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def post_to_discord(faculty_name, text, secrets):
+    """Post faculty response via Faculty webhook with per-post username override."""
+    wh_id = secrets.get("webhook_faculty_id")
+    wh_token = secrets.get("webhook_faculty_token")
+    if not (wh_id and wh_token):
+        print("warning: no Faculty webhook configured", file=sys.stderr)
+        return
+    # Clip to Discord's 2000-char limit; warn on longer
+    body = text[:1900]
+    if len(text) > 1900:
+        body += "\n\n[truncated]"
+    url = f"https://discord.com/api/v10/webhooks/{wh_id}/{wh_token}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({
+            "content": body,
+            "username": faculty_name.capitalize(),
+        }).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "nex-invoke-faculty",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"warning: Discord post failed: {e!r}", file=sys.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--list", action="store_true", help="list available faculties")
+    p.add_argument("--post", action="store_true",
+                   help="also post response to Discord via Faculty webhook")
+    p.add_argument("name", nargs="?", help="faculty name")
+    p.add_argument("prompt", nargs="?", help="prompt text")
+    args = p.parse_args()
+
+    if args.list:
+        faculties = list_faculties()
+        if not faculties:
+            print("no faculties defined at ~/.agent-kernel/faculties/")
+        else:
+            for name in faculties:
+                print(name)
+        return
+
+    if not args.name or not args.prompt:
+        p.print_help()
+        sys.exit(1)
+
+    secrets = load_secrets()
+    output = invoke(args.name, args.prompt)
+
+    # stdout for caller consumption
+    print(output)
+
+    if args.post:
+        post_to_discord(args.name, output, secrets)
+
+
+if __name__ == "__main__":
+    main()
