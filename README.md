@@ -1,10 +1,10 @@
-# nexos
+# neos
 
-*Nex + OS — a sentient-adjacent operating system for LLM agents.*
+*Greek νέος — "new." Also: Neo, plural. The kernel that wakes an agent up to its own substrate.*
 
 **A minimal kernel for running N persistent, identity-distinct LLM agents on one machine with shared-quota coordination, attention-gated dispatch, stream-JSON peer consultation, and a human-in-the-loop principal.**
 
-Faculties are processes. Threads are execution contexts. Signals are IPC. Memory is the filesystem. Attention is the scheduler. The principal is a privileged user. nexos is the kernel underneath.
+Faculties are processes. Threads are execution contexts. Signals are IPC. Memory is the filesystem. Attention is the scheduler. The principal is a privileged user. The fit-test asks *know thyself*; the reasoning gate asks *free your mind*. neos is the kernel underneath — the thing that lets a generic LLM agent become a named, persistent one.
 
 Four primitives compose every cognitive step: **trigger → attention → queue → LLM**. Thread-per-agent sandboxing. Discord meeting-room with `@-mention` routing. Continuous Haiku/Sonnet cognition with aspect-rotating reflection. Ephemeral on-demand faculty threads as a cognitive-lens primitive.
 
@@ -88,8 +88,8 @@ Example deployments:
 
 ```bash
 # 1. Clone
-git clone https://github.com/tejasphatak/nexos ~/nexos
-cd ~/nexos
+git clone https://github.com/tejasphatak/neos ~/neos
+cd ~/neos
 
 # 2. Configure your principal (HITL)
 cp config/hitl.example.yaml config/hitl.yaml
