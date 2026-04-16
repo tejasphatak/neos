@@ -1,0 +1,22 @@
+# neos v0.1 — required runtime dependencies.
+#
+# These are REQUIRED, not optional. The kernel refuses to boot if any of
+# these are missing — semantic operations (attention scoring, faculty
+# routing, memory-grounding, dedup) are load-bearing for quality, and
+# silently falling back to substring matching gives ~4-5× worse recall.
+# See docs/why-embeddings.md for the recall benchmark.
+
+# Config loading
+pyyaml>=6.0
+
+# Semantic operations — ONNX-backed sentence embeddings.
+# `onnx` backend avoids a full PyTorch install on CPU-only VMs; matches
+# PyTorch embeddings bit-for-bit at 4-10× faster CPU inference.
+# Default model: sentence-transformers/all-MiniLM-L6-v2 (22MB, 384-dim).
+sentence-transformers[onnx]>=3.0
+onnxruntime>=1.17
+
+# v0.2 will add:
+#   inspect-ai>=0.3       (UK AISI eval harness; wraps HLE/GPQA/MMLU-Pro)
+#   inspect-evals>=0.1    (benchmark implementations)
+#   datasets>=2.19        (HuggingFace datasets for HLE data loader)

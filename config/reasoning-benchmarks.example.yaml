@@ -12,7 +12,10 @@ reasoning_gates:
   #   Official site:  https://agi.safe.ai
   #   Paper:          https://arxiv.org/abs/2501.14249 (Phan et al., Jan 2025)
   #   Dataset:        https://huggingface.co/datasets/cais/hle (gated; request access)
-  #   Eval scripts:   https://github.com/centerforaisafety/hle  (v0.2 wraps these)
+  #   v0.2 eval:      inspect_ai + inspect_evals (UK AI Safety Institute)
+  #                   https://github.com/UKGovernmentBEIS/inspect_evals
+  #                   Covers HLE + GPQA + MMLU-Pro in one harness; we do NOT
+  #                   write our own scoring. See docs/why-hle.md.
   #   Published by Scale AI + Center for AI Safety (CAIS).
   # Why HLE: see docs/why-hle.md. Short version — it's the only current
   # benchmark that is non-saturated on frontier models, expert-calibrated,
@@ -34,7 +37,8 @@ reasoning_gates:
 
   # GPQA Diamond — graduate-level physics/chem/bio questions
   # https://huggingface.co/datasets/Idavidrein/gpqa
-  # Expert-calibrated; grad-student-plus difficulty
+  # Expert-calibrated; grad-student-plus difficulty.
+  # v0.2 eval: inspect_evals/gpqa (same harness as HLE; no bespoke scoring).
   - name: gpqa-diamond
     source: huggingface:Idavidrein/gpqa
     subset: diamond
@@ -45,6 +49,7 @@ reasoning_gates:
 
   # MMLU-Pro — multi-discipline multiple-choice, enhanced MMLU
   # https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro
+  # v0.2 eval: inspect_evals/mmlu_pro (same harness as HLE + GPQA).
   - name: mmlu-pro
     source: huggingface:TIGER-Lab/MMLU-Pro
     subsample: 100

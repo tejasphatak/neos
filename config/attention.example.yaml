@@ -1,0 +1,54 @@
+# neos — attention-gate configuration.
+#
+# The attention gate decides whether an incoming event dispatches to the
+# agent *right now* or queues silently for later. Inspired by transformer
+# attention: we score each event against the agent's current focus,
+# admit high-similarity events through a gated/closed state, queue the
+# rest.
+#
+# The gate has three states: OPEN | GATED | CLOSED.
+#   OPEN   — every event dispatches (default when agent isn't focused)
+#   GATED  — bypass-kinds + @mentions + URGENT + focus-relevant events dispatch
+#   CLOSED — bypass-kinds + URGENT + focus-relevant events dispatch (tightest)
+#
+# See docs/why-embeddings.md for the focus-relevance scoring rationale
+# and docs/attention-dispatch.md for the full gate state machine.
+
+# ===== Bypass kinds (ALWAYS dispatch, regardless of state) =====
+# These are hard-coded invariants: safety signals cannot be silenced.
+# Changing this list is a contract amendment, not a config tweak —
+# callers that emit these kinds assume they'll reach the agent.
+bypass_kinds:
+  - alert
+  - gate_blocker
+  - ethics
+  - mention
+
+# ===== Focus-relevance (semantic bypass) =====
+# When GATED or CLOSED, an event may still dispatch if it is semantically
+# close to the agent's declared focus. We embed both texts via
+# sentence-transformers/all-MiniLM-L6-v2 (ONNX backend), compute cosine
+# similarity, and admit if sim >= threshold.
+#
+# Threshold calibration (normalized 384-dim embeddings):
+#   0.70+  — very tight match; only near-paraphrases pass
+#   0.55   — default; topical and task-level matches pass, off-topic doesn't
+#   0.40   — loose; most same-domain content passes
+#   <0.30  — almost anything passes; barely a gate
+focus_relevance:
+  enabled: true
+  threshold: 0.55
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+
+# ===== URGENT regex fallback =====
+# Literal URGENT marker always bypasses, regardless of semantic score.
+# Kept as a regex path so a principal's explicit bypass works even when
+# embeddings are unavailable (though the kernel refuses to boot in that
+# case, per requirements.txt).
+urgent_pattern: '\burgent\b'    # case-insensitive
+
+# ===== Auto-expire =====
+# No focus session may last longer than this without explicit renewal.
+# Prevents silent-death if the agent gates and forgets to reopen.
+max_focus_minutes: 240
+default_focus_minutes: 30

@@ -25,16 +25,70 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+KERNEL = Path(__file__).resolve().parent.parent
 HOME = Path.home()
 STATE_PATH = HOME / ".nexus" / "state" / "attention.json"
+CONFIG_PATH = KERNEL / "config" / "attention.yaml"
+CONFIG_EXAMPLE = KERNEL / "config" / "attention.example.yaml"
+
+# Shared embeddings library for semantic focus-relevance scoring.
+sys.path.insert(0, str(KERNEL))
+try:
+    from lib.embeddings import rank as embeddings_rank, available as embeddings_available
+except ImportError:
+    embeddings_rank = None
+    embeddings_available = lambda: False
+
+# Defaults (overridden by config/attention.yaml when present).
 BYPASS_KINDS = ["alert", "gate_blocker", "ethics", "mention"]
 DEFAULT_FOCUS_MIN = 30
-MAX_FOCUS_MIN = 240  # 4h hard cap — even if agent asks longer, watchdog resets
+MAX_FOCUS_MIN = 240  # 4h hard cap
+DEFAULT_FOCUS_RELEVANCE_THRESHOLD = 0.55
+DEFAULT_URGENT_PATTERN = r"\burgent\b"
+
+_CONFIG = None
+
+
+def load_config():
+    """Load attention.yaml (or example) — NO hardcoded thresholds."""
+    global _CONFIG
+    if _CONFIG is not None:
+        return _CONFIG
+    try:
+        import yaml
+    except ImportError:
+        _CONFIG = {}
+        return _CONFIG
+    path = CONFIG_PATH if CONFIG_PATH.exists() else CONFIG_EXAMPLE
+    try:
+        with open(path) as f:
+            _CONFIG = yaml.safe_load(f) or {}
+    except (FileNotFoundError, OSError):
+        _CONFIG = {}
+    return _CONFIG
+
+
+def cfg_bypass_kinds():
+    return load_config().get("bypass_kinds", BYPASS_KINDS)
+
+
+def cfg_focus_relevance():
+    fr = load_config().get("focus_relevance", {}) or {}
+    return {
+        "enabled": fr.get("enabled", True),
+        "threshold": fr.get("threshold", DEFAULT_FOCUS_RELEVANCE_THRESHOLD),
+        "model": fr.get("model", "sentence-transformers/all-MiniLM-L6-v2"),
+    }
+
+
+def cfg_urgent_pattern():
+    return load_config().get("urgent_pattern", DEFAULT_URGENT_PATTERN)
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -91,28 +145,70 @@ def set_state(new_state, focus=None, duration_min=None):
     return st
 
 def is_urgent(content):
-    """Match Tejas's URGENT human-bypass marker.
-    Catches !URGENT!, URGENT!!, URGENT!!!!!, urgent!!! (case-insensitive),
-    and plain 'URGENT' as a standalone word.
-    """
+    """Match the URGENT hard-bypass marker. Regex path kept as a last-
+    resort bypass so principals can always reach the agent even if
+    semantic scoring misfires."""
     if not content:
         return False
-    import re
-    # Match standalone word URGENT (any case) — simple + permissive
-    # Catches: URGENT, Urgent, !URGENT!, URGENT!!!!, urgent, !urgent
-    return bool(re.search(r"\burgent\b", content, re.IGNORECASE))
+    return bool(re.search(cfg_urgent_pattern(), content, re.IGNORECASE))
+
+
+def focus_relevant(focus_text, content):
+    """True iff `content` is semantically close to `focus_text` at or
+    above the configured cosine threshold. This is the transformer-style
+    attention path: rather than string-matching, we embed both texts and
+    admit events whose semantics track the agent's current focus.
+
+    See docs/why-embeddings.md for the 4-5× recall argument vs. substring
+    matching on fuzzy queries.
+
+    Returns False if embeddings are unavailable, or if either text is
+    empty, or if similarity is below threshold.
+    """
+    if not focus_text or not content:
+        return False
+    fr = cfg_focus_relevance()
+    if not fr["enabled"]:
+        return False
+    if embeddings_rank is None:
+        # Library not installed. Required-dep per requirements.txt; we
+        # fail open (admit) rather than silently drop events here so the
+        # gate doesn't silently become tighter on install misconfig.
+        # The boot gate in nex-init refuses to proceed without embeddings,
+        # so reaching this branch implies a user bypass.
+        return False
+    try:
+        scored = embeddings_rank(focus_text, [content], model_name=fr["model"], top_k=1)
+    except Exception:
+        return False
+    if not scored:
+        return False
+    _, _, sim = scored[0]
+    return sim >= fr["threshold"]
+
 
 def dispatchable(st, kind, mention=False, content=None):
-    """Return True if an event of this kind+mention+content should dispatch."""
+    """Return True if an event of this kind+mention+content should dispatch.
+
+    Order of bypass checks (first hit wins):
+      1. state == OPEN
+      2. kind in bypass_kinds (alert / gate_blocker / ethics / mention)
+      3. explicit @mention flag
+      4. URGENT marker in content (regex; explicit human bypass)
+      5. focus-relevant content (semantic; cosine >= threshold)
+    Otherwise: queue silently.
+    """
     if st["state"] == "open":
         return True
-    if kind in st.get("bypass_kinds", BYPASS_KINDS):
+    if kind in st.get("bypass_kinds", cfg_bypass_kinds()):
         return True
     if mention:
         return True
     if content and is_urgent(content):
         return True
-    return False  # GATED and CLOSED both queue-only for non-bypass events
+    if content and focus_relevant(st.get("focus"), content):
+        return True
+    return False
 
 def cmd_status(args):
     st = load()
@@ -138,6 +234,30 @@ def cmd_dispatchable(args):
     st = load()
     sys.exit(0 if dispatchable(st, args.kind, args.mention, args.content) else 1)
 
+
+def cmd_score(args):
+    """Score an event's semantic relevance to the current focus. Useful
+    for calibrating the threshold and debugging why an event did/didn't
+    bypass the gate."""
+    st = load()
+    focus = st.get("focus")
+    if not focus:
+        print(json.dumps({"error": "no focus set; score has no meaning"}, indent=2))
+        sys.exit(2)
+    if embeddings_rank is None:
+        print(json.dumps({"error": "sentence-transformers not installed; install requirements.txt"}, indent=2))
+        sys.exit(3)
+    fr = cfg_focus_relevance()
+    scored = embeddings_rank(focus, [args.content], model_name=fr["model"], top_k=1)
+    sim = scored[0][2] if scored else None
+    print(json.dumps({
+        "focus": focus,
+        "content": args.content,
+        "similarity": sim,
+        "threshold": fr["threshold"],
+        "would_bypass": sim is not None and sim >= fr["threshold"],
+    }, indent=2))
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -153,7 +273,9 @@ def main():
     d = sub.add_parser("dispatchable")
     d.add_argument("--kind", required=True)
     d.add_argument("--mention", action="store_true")
-    d.add_argument("--content", default=None, help="Message body — URGENT marker auto-detects and bypasses gate.")
+    d.add_argument("--content", default=None, help="Message body — URGENT marker auto-detects and bypasses gate; also checked for semantic focus-relevance.")
+    sc = sub.add_parser("score", help="Compute semantic similarity of content to current focus")
+    sc.add_argument("--content", required=True)
     args = p.parse_args()
     dispatch = {
         "status": cmd_status,
@@ -162,6 +284,7 @@ def main():
         "close": cmd_close,
         "check": cmd_check,
         "dispatchable": cmd_dispatchable,
+        "score": cmd_score,
     }
     dispatch[args.cmd](args)
 

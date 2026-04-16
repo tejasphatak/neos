@@ -136,7 +136,9 @@ Skip with `--skip-fit-test` (NOT recommended; only for debugging).
 
 ## v0.1 status
 
-Scaffolding shipped. Actual benchmark loading (HuggingFace `datasets` lib + GitHub JSON) + LLM-as-judge scoring is v0.2. For v0.1, users can manually download + run against `nex-invoke agent <name>` and feed results into the gate check.
+Scaffolding shipped. For v0.1, users can manually run benchmarks and feed pass-rates into the gate check.
+
+**v0.2 will wrap `inspect_ai` + `inspect_evals` (UK AI Safety Institute) — not build our own.** That single harness covers HLE, GPQA, and MMLU-Pro against their canonical datasets with upstream-compatible scoring (identical to published leaderboard numbers). Deep rationale in `docs/why-hle.md` — we chose inspect_evals over lm-evaluation-harness (no HLE support) and over rolling our own (reinvention without credibility). Falls back to CAIS's `github.com/centerforaisafety/hle` if inspect_evals is ever unavailable.
 
 ## Rationale
 

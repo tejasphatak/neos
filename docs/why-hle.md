@@ -160,24 +160,47 @@ Writing a bespoke `neos-reasoning-test.json` would be easier in the short term a
 
 Using HLE flips that. HLE is maintained by CAIS (Center for AI Safety) and Scale AI, cited in ~every frontier-model paper since January 2025, with a public leaderboard readers can cross-check. When `neos` says *"this backend scored ≥15% on 50 text-only HLE questions,"* that sentence has the same meaning it has in a DeepMind or Anthropic system-card — because it IS the same benchmark. Credibility is not something we produced; it's something we inherited by adopting the field's benchmark instead of writing our own.
 
-## v0.2 integration plan — wrap, don't reinvent
+## v0.2 integration plan — wrap a highly-cited open-source harness, don't reinvent
 
-CAIS ships an official evaluation pipeline at **github.com/centerforaisafety/hle**:
+**We do not build our own eval framework.** The field has already converged on a small set of well-maintained open-source harnesses; writing a bespoke one would be slower, less trusted, and would drift from upstream scoring semantics as the benchmarks evolve. We chose **inspect_ai + inspect_evals** (UK AI Safety Institute):
 
-- `hle_eval/run_model_predictions.py` — runs a model over the dataset via OpenAI-API-compatible interface
-- `hle_eval/run_judge_results.py` — LLM-as-judge scoring
-- Supports any provider reachable through the OpenAI SDK (OpenAI / Anthropic via proxy / Gemini via proxy / local vLLM / Ollama with an OpenAI shim)
+| Framework | Stars | Covers HLE? | Covers GPQA? | Covers MMLU-Pro? | Maintainer |
+|---|---|---|---|---|---|
+| **inspect_evals** (on `inspect_ai`) | **1.9k + 440** | ✅ | ✅ | ✅ | **UK AISI** |
+| EleutherAI/lm-evaluation-harness | 12.2k | ❌ | ✅ | ✅ | EleutherAI |
+| HuggingFace/lighteval | 2.4k | partial | ✅ | ✅ | HuggingFace |
+| CAIS/hle (HLE only) | 1.5k | ✅ (authoritative) | ❌ | ❌ | CAIS |
 
-v0.2 of `nex-reasoning-bench` will **wrap these scripts**, not replace them:
+lm-evaluation-harness has more stars but no HLE support as of this writing; we would have had to wedge HLE into it ourselves, which is exactly the reinvention we're avoiding. `inspect_evals` ships first-class `hle`, `gpqa`, and `mmlu_pro` eval modules written against the canonical datasets. That is the entire v0.2 dependency.
 
-1. Use `datasets.load_dataset("cais/hle", split="test")` to pull the canonical data.
-2. Apply our `lib.hle.filter_text_only` filter (tested under `tests/test_hle_filter.py`).
-3. Random-subsample 50 rows with a seed recorded in the stamp.
-4. Shell out to `run_model_predictions.py` against the target agent's OpenAI-API-compatible endpoint.
-5. Shell out to `run_judge_results.py` with Sonnet-tier judge.
-6. Parse `accuracy` from the emitted `*** Metrics ***` block; compare to `threshold_pct`.
+### Narrative fit
 
-This keeps our scoring identical to the upstream — which is the point. We don't want "neos-variant HLE scoring." We want the same number frontier labs report.
+**inspect_ai** is maintained by the **UK AI Safety Institute**. Our use case is *pre-deployment safety gating of an autonomous LLM agent*. Using the UK government safety institute's evaluation framework as our boot gate is not coincidental credibility — it is the right tool, built for exactly this purpose, by exactly the right organization.
+
+### What v0.2 will do
+
+1. Add `inspect-ai` + `inspect-evals` to `requirements.txt`.
+2. Replace `run_gate()`'s scaffold body with a shell-out to `inspect eval inspect_evals/hle ...` (similar for GPQA and MMLU-Pro).
+3. Apply our `lib.hle.filter_text_only` before passing rows to the harness (via `--limit` + filter hook).
+4. Parse the harness's JSONL output; extract accuracy; compare to `threshold_pct`.
+5. Record the inspect-ai run log path in the stamp so audits are reproducible.
+
+### What v0.2 will NOT do
+
+- Write our own scoring logic. (inspect_ai does this — LLM-as-judge for HLE, exact-match for multi-choice on GPQA / MMLU-Pro.)
+- Write our own dataset loaders. (inspect_evals wraps `datasets.load_dataset` correctly including canary handling.)
+- Write our own prompt templates. (inspect_evals ships the ones used in upstream leaderboards — using different prompts would make our scores incomparable to published numbers.)
+
+This keeps our scoring identical to the upstream — which is the point. We don't want "neos-variant HLE scoring." We want the same number frontier labs report. Writing a parallel eval would be the opposite of the credibility argument we just made.
+
+### Fallback if inspect_evals is ever unavailable
+
+If for any reason `inspect_evals` becomes unmaintained, drops HLE support, or is unreachable:
+
+1. **First fallback**: CAIS's official `hle_eval/` from `github.com/centerforaisafety/hle` (authoritative for HLE specifically).
+2. **Second fallback**: lm-evaluation-harness for GPQA + MMLU-Pro (both covered); pair with CAIS's scripts for HLE.
+
+We'd never fall back to hand-rolled scoring.
 
 ## Canary-string protection
 
